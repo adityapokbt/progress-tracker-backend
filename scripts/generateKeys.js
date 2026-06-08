@@ -1,53 +1,67 @@
-const ProductKey = require('../models/ProductKey');
-require('dotenv').config();
+const { db } = require('../firebase');
 
 const generateProductKey = () => {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let key = 'POS-';
-  for (let i = 0; i < 12; i++) {
-    if (i > 0 && i % 4 === 0) key += '-';
-    key += chars.charAt(Math.floor(Math.random() * chars.length));
+  let key = 'POS';
+
+  for (let i = 0; i < 3; i++) {
+    let part = '';
+    for (let j = 0; j < 4; j++) {
+      part += chars[Math.floor(Math.random() * chars.length)];
+    }
+    key += '-' + part;
   }
+
   return key;
 };
 
 const generateKeys = async () => {
   try {
-    console.log('Using Firebase Firestore');
-
-    const keys = [];
-    const batchSize = 100;
     const totalKeys = 500;
+    const batchSize = 100;
+    
+    console.log('🚀 Starting product key generation on Render...');
+    console.log(`📊 Total keys to generate: ${totalKeys}`);
 
-    console.log(`Generating ${totalKeys} product keys...`);
-
+    let batch = db.batch();
+    let batchCount = 0;
+    
     for (let i = 0; i < totalKeys; i++) {
-      keys.push({
-        key: generateProductKey(),
+      const key = generateProductKey();
+      const docRef = db.collection('productKeys').doc();
+      
+      batch.set(docRef, {
+        key,
         createdBy: 'admin',
         createdAt: new Date(),
-        isUsed: false,
+        isUsed: false
       });
-
-      if (keys.length === batchSize || i === totalKeys - 1) {
-        await ProductKey.insertMany(keys);
-        console.log(`Generated ${i + 1}/${totalKeys} keys`);
-        keys.length = 0;
+      
+      batchCount++;
+      
+      if (batchCount === batchSize || i === totalKeys - 1) {
+        await batch.commit();
+        console.log(`✓ Generated ${i + 1}/${totalKeys} keys`);
+        batch = db.batch();
+        batchCount = 0;
       }
     }
 
-    console.log('Successfully generated 500 product keys!');
-    console.log('Keys are now available for signup.');
-
-    const sampleKeys = await ProductKey.find().limit(5);
-    console.log('\nSample product keys:');
-    sampleKeys.forEach((key, index) => {
-      console.log(`${index + 1}. ${key.key}`);
+    console.log('\n✅ SUCCESS: 500 product keys created successfully!');
+    
+    // Display sample keys
+    const snapshot = await db.collection('productKeys').limit(5).get();
+    console.log('\n📝 Sample product keys (first 5):');
+    let index = 1;
+    snapshot.forEach(doc => {
+      console.log(`${index++}. ${doc.data().key}`);
     });
-
+    
+    console.log('\n🎉 Keys are ready for user signup!');
     process.exit(0);
-  } catch (error) {
-    console.error('Error generating keys:', error);
+
+  } catch (err) {
+    console.error('❌ Error generating keys:', err);
     process.exit(1);
   }
 };
