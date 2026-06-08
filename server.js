@@ -1,62 +1,74 @@
 // server.js
 require('dotenv').config();
 const express = require('express');
-const { db } = require('./firebase');
 const cors = require('cors');
+const { db } = require('./firebase');
 
 const app = express();
 
-// CORS Middleware - Updated to allow all development origins
+/**
+ * =========================
+ * CORS CONFIG (FIXED)
+ * =========================
+ */
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
+  'http://localhost:5000',
+  'http://localhost:5001',
+  'http://localhost:5002',
+  'https://progress-tracker-frontend-tc8d.vercel.app'
+];
+
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-    
-    // Allow all localhost ports and common development origins
-    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+    if (!origin) return callback(null, true); // mobile apps / postman
+
+    if (
+      allowedOrigins.includes(origin) ||
+      origin.endsWith('.vercel.app')
+    ) {
       return callback(null, true);
     }
-    
-    // Allow specific production domains if needed
-    const allowedOrigins = [
-      'http://localhost:3000', 
-      'http://localhost:3001',
-      'http://localhost:3002',
-      'http://localhost:3003',
-      'http://localhost:5000',
-      'http://localhost:5001',
-      'http://localhost:5002'
-    ];
-    
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
+
+    return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Cache-Control'] // ADD Cache-Control here
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Cache-Control']
 }));
-// Add request logging
+
+// Preflight
+app.options('*', cors());
+
+/**
+ * =========================
+ * MIDDLEWARE
+ * =========================
+ */
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Request Logger
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
     console.log('Request body:', JSON.stringify(req.body, null, 2));
   }
   next();
 });
 
-app.options('*', cors());
+/**
+ * =========================
+ * BASIC ROUTES
+ * =========================
+ */
 
-// Body parsing middleware
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// Test API endpoint
 app.get('/api', (req, res) => {
-  res.json({ 
-    message: 'POS SaaS API is working!',
+  res.json({
+    message: 'Progress Tracker API running',
+    status: 'OK',
     timestamp: new Date().toISOString(),
     endpoints: {
       auth: '/api/auth',
@@ -67,6 +79,7 @@ app.get('/api', (req, res) => {
       transactions: '/api/transactions',
       purchaseOrders: '/api/purchase-orders',
       staff: '/api/staff',
+      staffSettings: '/api/staff-settings',
       test: '/api/test',
       health: '/api/health',
       dbStatus: '/api/db-status'
@@ -74,21 +87,40 @@ app.get('/api', (req, res) => {
   });
 });
 
-// Add a simple test endpoint
 app.get('/api/test', (req, res) => {
-  res.json({ 
-    message: 'Test endpoint is working!',
+  res.json({
+    message: 'API working fine',
     timestamp: new Date().toISOString()
   });
 });
 
-// Firebase Firestore
-console.log('Firebase Firestore initialized for project:', process.env.FIREBASE_PROJECT_ID);
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    uptime: process.uptime(),
+    database: db ? 'connected' : 'disconnected',
+    memoryUsage: process.memoryUsage(),
+    env: process.env.NODE_ENV || 'development',
+    timestamp: new Date().toISOString()
+  });
+});
 
-// Import routes (added staffRoutes)
+app.get('/api/db-status', (req, res) => {
+  res.json({
+    connected: !!db,
+    provider: 'firebase',
+    projectId: process.env.FIREBASE_PROJECT_ID || null,
+    timestamp: new Date().toISOString()
+  });
+});
 
-const settingsRoutes = require('./routes/settings');
+/**
+ * =========================
+ * ROUTES IMPORTS
+ * =========================
+ */
 const authRoutes = require('./routes/auth');
+const settingsRoutes = require('./routes/settings');
 const inventoryRoutes = require('./routes/inventory');
 const supplierRoutes = require('./routes/suppliers');
 const purchaseOrderRoutes = require('./routes/purchaseOrders');
@@ -97,11 +129,13 @@ const billsRoutes = require('./routes/bills');
 const staffRoutes = require('./routes/staff');
 const staffSettingsRoutes = require('./routes/staffSettings');
 const errorLogger = require('./middleware/errorLogger');
-// Added staff routes
-// Middleware
-app.use(express.json());
 
-// Mount routes with /api prefix (added staff route)
+/**
+ * =========================
+ * ROUTE MIDDLEWARE
+ * =========================
+ */
+
 app.use('/api/auth', authRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/inventory', inventoryRoutes);
@@ -112,56 +146,36 @@ app.use('/api/bills', billsRoutes);
 app.use('/api/staff', staffRoutes);
 app.use('/api/staff-settings', staffSettingsRoutes);
 app.use(errorLogger);
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  const healthStatus = {
-    status: 'OK',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    database: db ? 'connected' : 'disconnected',
-    memoryUsage: process.memoryUsage(),
-    environment: process.env.NODE_ENV || 'development'
-  };
-  
-  res.status(200).json(healthStatus);
-});
 
-// Database status endpoint
-app.get('/api/db-status', (req, res) => {
-  const dbStatus = {
-    connected: !!db,
-    provider: 'firebase',
-    projectId: process.env.FIREBASE_PROJECT_ID || null,
-    readyStateDescription: db ? 'connected' : 'disconnected'
-  };
-  
-  res.status(200).json(dbStatus);
-});
+/**
+ * =========================
+ * 404 HANDLERS
+ * =========================
+ */
 
-// 404 handler for API routes
 app.use('/api/*', (req, res) => {
-  res.status(404).json({ 
-    status: 'error', 
+  res.status(404).json({
+    success: false,
     message: 'API route not found',
     requestedUrl: req.originalUrl
   });
 });
 
-// General 404 handler
 app.use('*', (req, res) => {
-  res.status(404).json({ 
-    status: 'error', 
+  res.status(404).json({
+    success: false,
     message: 'Route not found',
     availableRoutes: [
-      '/api', 
-      '/api/auth', 
+      '/api',
+      '/api/auth',
       '/api/settings',
-      '/api/inventory', 
+      '/api/inventory',
       '/api/bills',
       '/api/suppliers',
       '/api/transactions',
       '/api/purchase-orders',
-      '/api/staff', // Added staff route
+      '/api/staff',
+      '/api/staff-settings',
       '/api/test',
       '/api/health',
       '/api/db-status'
@@ -169,71 +183,92 @@ app.use('*', (req, res) => {
   });
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Error:', err.stack);
+/**
+ * =========================
+ * ERROR HANDLER
+ * =========================
+ */
 
+app.use((err, req, res, next) => {
+  console.error('ERROR:', err.message);
+  console.error('Stack:', err.stack);
+
+  // Validation Error
   if (err.name === 'ValidationError') {
     const errors = Object.values(err.errors).map(el => el.message);
-    return res.status(400).json({ 
-      status: 'fail', 
-      message: 'Validation error', 
-      errors 
+    return res.status(400).json({
+      success: false,
+      message: 'Validation error',
+      errors
     });
   }
 
+  // Duplicate Key Error
   if (err.code === 11000) {
     const field = Object.keys(err.keyValue)[0];
-    return res.status(400).json({ 
-      status: 'fail', 
-      message: `${field} already exists` 
+    return res.status(400).json({
+      success: false,
+      message: `${field} already exists`
     });
   }
 
+  // JWT Errors
   if (err.name === 'JsonWebTokenError') {
-    return res.status(401).json({ 
-      status: 'fail', 
-      message: 'Invalid token' 
+    return res.status(401).json({
+      success: false,
+      message: 'Invalid token'
     });
   }
 
   if (err.name === 'TokenExpiredError') {
-    return res.status(401).json({ 
-      status: 'fail', 
-      message: 'Token expired' 
+    return res.status(401).json({
+      success: false,
+      message: 'Token expired'
     });
   }
 
-  // CORS errors
+  // CORS Errors
   if (err.message === 'Not allowed by CORS') {
-    return res.status(403).json({ 
-      status: 'error', 
-      message: 'CORS error: Request not allowed from this origin' 
+    return res.status(403).json({
+      success: false,
+      message: 'CORS blocked this request'
     });
   }
 
+  // Default Server Error
   res.status(500).json({
-    status: 'error',
-    message: 'Something went wrong!',
-    ...(process.env.NODE_ENV === 'development' && { error: err.message })
+    success: false,
+    message: 'Server error',
+    error: process.env.NODE_ENV === 'development' ? err.message : undefined
   });
 });
 
-// Server listen
-const PORT = process.env.PORT || 5000;
+/**
+ * =========================
+ * START SERVER
+ * =========================
+ */
+
+const PORT = process.env.PORT || 5001;
 const server = app.listen(PORT, () => {
-  console.log(`\n=== POS SaaS Server Started ===`);
-  console.log(`Server running on port ${PORT}`);
-  console.log(`API available at http://localhost:${PORT}/api`);
-  console.log(`Test endpoint: http://localhost:${PORT}/api/test`);
-  console.log(`Health check: http://localhost:${PORT}/api/health`);
-  console.log(`DB status: http://localhost:${PORT}/api/db-status`);
-  console.log(`CORS enabled for all localhost origins`);
+  console.log('==============================');
+  console.log('🚀 Server Started');
+  console.log('==============================');
+  console.log(`Port: ${PORT}`);
+  console.log(`API: http://localhost:${PORT}/api`);
+  console.log(`Test: http://localhost:${PORT}/api/test`);
+  console.log(`Health: http://localhost:${PORT}/api/health`);
+  console.log(`DB Status: http://localhost:${PORT}/api/db-status`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`================================\n`);
+  console.log('==============================');
 });
 
-// Graceful shutdown
+/**
+ * =========================
+ * GRACEFUL SHUTDOWN
+ * =========================
+ */
+
 const gracefulShutdown = async (signal) => {
   console.log(`\nReceived ${signal}. Shutting down gracefully...`);
   
@@ -244,8 +279,7 @@ const gracefulShutdown = async (signal) => {
     }
     
     console.log('HTTP server closed.');
-    
-    console.log('Firebase connection closed');
+    console.log('Shutdown complete.');
     process.exit(0);
   });
 };
@@ -264,4 +298,4 @@ process.on('unhandledRejection', (reason, promise) => {
   gracefulShutdown('unhandledRejection');
 });
 
-module.exports = app;// fix pdfkit issue
+module.exports = app;

@@ -1,8 +1,147 @@
+// routes/bills.js
 const express = require('express');
 const router = express.Router();
+const PDFDocument = require('pdfkit');
 const Bill = require('../models/Bill');
 const Product = require('../models/Product');
 const PaymentRecord = require('../models/PaymentRecord');
+
+// Helper function to generate PDF bill
+const generateBillPDF = async (bill) => {
+  return new Promise((resolve, reject) => {
+    try {
+      // Create PDF document with buffer support
+      const doc = new PDFDocument({
+        size: 'A4',
+        margins: { top: 50, bottom: 50, left: 50, right: 50 },
+        bufferPages: true,
+        autoFirstPage: true
+      });
+      
+      const chunks = [];
+      doc.on('data', chunk => chunks.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
+      
+      // Header
+      doc.fontSize(20)
+         .font('Helvetica-Bold')
+         .text('INVOICE', { align: 'center' });
+      
+      doc.moveDown();
+      
+      // Bill Info
+      doc.fontSize(10)
+         .font('Helvetica')
+         .text(`Bill Number: ${bill.billNumber}`, { continued: true })
+         .text(`Date: ${new Date(bill.createdAt).toLocaleString()}`, { align: 'right' });
+      
+      doc.moveDown();
+      
+      // Customer Info
+      if (bill.customer && bill.customer.name) {
+        doc.fontSize(12)
+           .font('Helvetica-Bold')
+           .text('Customer Information');
+        
+        doc.fontSize(10)
+           .font('Helvetica')
+           .text(`Name: ${bill.customer.name || 'N/A'}`)
+           .text(`Phone: ${bill.customer.phone || 'N/A'}`);
+        
+        doc.moveDown();
+      }
+      
+      // Items Table Header
+      doc.fontSize(10)
+         .font('Helvetica-Bold');
+      
+      const startX = doc.x;
+      const col1 = 50;
+      const col2 = 250;
+      const col3 = 350;
+      const col4 = 450;
+      const col5 = 500;
+      
+      doc.text('Item', col1, doc.y);
+      doc.text('Qty', col2, doc.y);
+      doc.text('Price', col3, doc.y);
+      doc.text('Total', col5, doc.y);
+      
+      doc.moveDown();
+      doc.strokeColor('#000000')
+         .lineWidth(0.5)
+         .moveTo(50, doc.y)
+         .lineTo(550, doc.y)
+         .stroke();
+      
+      doc.moveDown(0.5);
+      
+      // Items
+      doc.font('Helvetica');
+      let totalAmount = 0;
+      
+      bill.items.forEach(item => {
+        const itemTotal = item.price * item.quantity;
+        totalAmount += itemTotal;
+        
+        doc.text(item.name.substring(0, 30), col1, doc.y);
+        doc.text(item.quantity.toString(), col2, doc.y);
+        doc.text(`₹${item.price.toFixed(2)}`, col3, doc.y);
+        doc.text(`₹${itemTotal.toFixed(2)}`, col5, doc.y);
+        doc.moveDown();
+      });
+      
+      // Total Line
+      doc.moveDown();
+      doc.strokeColor('#000000')
+         .lineWidth(0.5)
+         .moveTo(50, doc.y)
+         .lineTo(550, doc.y)
+         .stroke();
+      
+      doc.moveDown(0.5);
+      doc.font('Helvetica-Bold')
+         .text(`Total: ₹${totalAmount.toFixed(2)}`, 450, doc.y);
+      
+      doc.moveDown();
+      
+      // Payment Information
+      if (bill.payment) {
+        doc.font('Helvetica-Bold')
+           .text('Payment Information');
+        
+        doc.font('Helvetica');
+        doc.text(`Payment Type: ${bill.payment.type || 'N/A'}`);
+        
+        if (bill.payment.methods && bill.payment.methods.length > 0) {
+          doc.text('Payment Methods:');
+          bill.payment.methods.forEach(method => {
+            doc.text(`  - ${method.method}: ₹${method.amount.toFixed(2)}`);
+          });
+        }
+        
+        if (bill.payment.outstandingAmount > 0) {
+          doc.font('Helvetica-Bold')
+             .fillColor('red')
+             .text(`Outstanding Amount: ₹${bill.payment.outstandingAmount.toFixed(2)}`)
+             .fillColor('black');
+        }
+      }
+      
+      // Footer
+      doc.moveDown(2);
+      doc.fontSize(8)
+         .font('Helvetica')
+         .text('Thank you for your business!', { align: 'center' });
+      
+      doc.end();
+      
+    } catch (error) {
+      reject(error);
+    }
+  });
+};
 
 // Get all credit customers with their bills
 router.get('/credit/customers', async (req, res) => {
@@ -47,6 +186,31 @@ router.get('/credit/customers', async (req, res) => {
     res.status(500).json({ 
       success: false, 
       error: 'Failed to fetch credit customers' 
+    });
+  }
+});
+
+// Generate PDF for a bill
+router.get('/:billNumber/pdf', async (req, res) => {
+  try {
+    const bill = await Bill.findOne({ billNumber: req.params.billNumber });
+    
+    if (!bill) {
+      return res.status(404).json({ success: false, error: 'Bill not found' });
+    }
+    
+    const pdfBuffer = await generateBillPDF(bill);
+    
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=bill_${bill.billNumber}.pdf`);
+    res.setHeader('Content-Length', pdfBuffer.length);
+    
+    res.send(pdfBuffer);
+  } catch (error) {
+    console.error('Error generating PDF:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to generate PDF' 
     });
   }
 });
@@ -144,7 +308,7 @@ router.post('/credit/process-payment', async (req, res) => {
         message: 'Payment processed successfully',
         bill
       });
-    } else {
+    } else if (customerPhone) {
       const customerBills = await Bill.find({ 
         'customer.phone': customerPhone, 
         'payment.outstandingAmount': { $gt: 0 }
@@ -222,6 +386,11 @@ router.post('/credit/process-payment', async (req, res) => {
         success: true, 
         message: 'Payment processed successfully for customer' 
       });
+    } else {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Either billId or customerPhone is required' 
+      });
     }
   } catch (error) {
     console.error('Error processing payment:', error);
@@ -240,7 +409,7 @@ router.patch('/:id/payment', async (req, res) => {
     const bill = await Bill.findByIdAndUpdate(
       req.params.id,
       { payment },
-      { new: true }
+      { new: true, runValidators: true }
     );
 
     if (!bill) {
@@ -333,6 +502,8 @@ router.get('/profit/range', async (req, res) => {
     }
 
     const start = new Date(startDate);
+    start.setHours(0, 0, 0, 0);
+    
     const end = new Date(endDate);
     end.setHours(23, 59, 59, 999);
 
@@ -406,16 +577,22 @@ router.post('/', async (req, res) => {
     const billData = req.body;
     
     // Validate payment data
-    if (billData.payment.type === 'split') {
-      const totalMethodAmount = billData.payment.methods.reduce((sum, method) => sum + method.amount, 0);
-      if (totalMethodAmount !== billData.payment.totalPaid + (billData.payment.outstandingAmount || 0)) {
-        return res.status(400).json({ success: false, error: 'Total paid amount plus outstanding amount must equal sum of payment method amounts' });
+    if (billData.payment && billData.payment.type === 'split') {
+      const totalMethodAmount = billData.payment.methods.reduce((sum, method) => sum + (method.amount || 0), 0);
+      const totalPaidWithOutstanding = (billData.payment.totalPaid || 0) + (billData.payment.outstandingAmount || 0);
+      
+      if (Math.abs(totalMethodAmount - totalPaidWithOutstanding) > 0.01) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Total paid amount plus outstanding amount must equal sum of payment method amounts' 
+        });
       }
     }
 
     const newBill = new Bill(billData);
     const savedBill = await newBill.save();
     
+    // Update product stock
     for (const item of billData.items) {
       await Product.findByIdAndUpdate(
         item.productId,
@@ -463,7 +640,7 @@ router.get('/', async (req, res) => {
 // Get specific bill by billNumber
 router.get('/:billNumber', async (req, res) => {
   try {
-    const bill = await Bill.findOne({ billNumber: req.params.billNumber });
+    const bill = await Bill.findOne({ billNumber: parseInt(req.params.billNumber) });
     
     if (!bill) {
       return res.status(404).json({ success: false, error: 'Bill not found' });
@@ -485,6 +662,7 @@ router.delete('/:id', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Bill not found' });
     }
     
+    // Restore product stock
     for (const item of bill.items) {
       await Product.findByIdAndUpdate(
         item.productId,
@@ -521,12 +699,14 @@ router.get('/sales/today', async (req, res) => {
     const billsCount = todayBills.length;
     
     res.json({
+      success: true,
       totalSales,
       billsCount,
       bills: todayBills
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error fetching today\'s sales:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -550,11 +730,13 @@ router.get('/sales/yesterday', async (req, res) => {
     const totalSales = yesterdayBills.reduce((sum, bill) => sum + bill.total, 0);
     
     res.json({
+      success: true,
       totalSales,
       billsCount: yesterdayBills.length
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error fetching yesterday\'s sales:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -594,11 +776,13 @@ router.get('/sales/last7days', async (req, res) => {
     const last7DaysSales = daysOfWeek.map(day => salesByDay[day]);
     
     res.json({
+      success: true,
       last7DaysSales,
       daysOfWeek
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error fetching last 7 days sales:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -687,9 +871,10 @@ router.get('/customers/new-this-month', async (req, res) => {
       { $count: 'count' }
     ]);
 
-    res.json({ count: newCustomers[0]?.count || 0 });
+    res.json({ success: true, count: newCustomers[0]?.count || 0 });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error fetching new customers:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -706,7 +891,7 @@ router.get('/customers/returning-percentage', async (req, res) => {
     });
 
     if (thisMonthCustomers.length === 0) {
-      return res.json({ percentage: 0 });
+      return res.json({ success: true, percentage: 0 });
     }
 
     const returningCount = await Bill.aggregate([
@@ -723,9 +908,10 @@ router.get('/customers/returning-percentage', async (req, res) => {
 
     const percentage = Math.round(((returningCount[0]?.count || 0) / thisMonthCustomers.length) * 100);
 
-    res.json({ percentage });
+    res.json({ success: true, percentage });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error fetching returning percentage:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -737,9 +923,10 @@ router.get('/customers/credit-count', async (req, res) => {
       'customer.phone': { $ne: null }
     });
 
-    res.json({ count: creditCustomers.length });
+    res.json({ success: true, count: creditCustomers.length });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error fetching credit count:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -771,15 +958,17 @@ router.get('/customers/top-spender-this-month', async (req, res) => {
     ]);
 
     if (topSpender.length === 0) {
-      return res.json({ name: '', phone: '' });
+      return res.json({ success: true, name: '', phone: '' });
     }
 
     res.json({
+      success: true,
       name: topSpender[0]._id.name,
       phone: topSpender[0]._id.phone
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error fetching top spender:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -788,7 +977,8 @@ router.get('/credit-bills', async (req, res) => {
   try {
     const creditBills = await Bill.find({ 
       'payment.methods': { $elemMatch: { method: 'credit' } }
-    });
+    }).sort({ createdAt: -1 });
+    
     res.json({ success: true, bills: creditBills });
   } catch (error) {
     console.error('Error fetching credit bills:', error);
@@ -804,6 +994,8 @@ router.get('/payment-methods/distribution', async (req, res) => {
     let query = {};
     if (startDate && endDate) {
       const start = new Date(startDate);
+      start.setHours(0, 0, 0, 0);
+      
       const end = new Date(endDate);
       end.setHours(23, 59, 59, 999);
       
@@ -823,15 +1015,21 @@ router.get('/payment-methods/distribution', async (req, res) => {
     };
     
     bills.forEach(bill => {
-      if (bill.payment.type === 'single') {
-        const method = bill.payment.methods[0].method;
-        distribution[method].count++;
-        distribution[method].amount += bill.payment.methods[0].amount;
-      } else {
-        bill.payment.methods.forEach(method => {
-          distribution[method.method].count++;
-          distribution[method.method].amount += method.amount;
-        });
+      if (bill.payment && bill.payment.methods) {
+        if (bill.payment.type === 'single' && bill.payment.methods[0]) {
+          const method = bill.payment.methods[0].method;
+          if (distribution[method]) {
+            distribution[method].count++;
+            distribution[method].amount += bill.payment.methods[0].amount;
+          }
+        } else if (bill.payment.methods.length > 0) {
+          bill.payment.methods.forEach(method => {
+            if (distribution[method.method]) {
+              distribution[method.method].count++;
+              distribution[method.method].amount += method.amount;
+            }
+          });
+        }
       }
     });
     
@@ -839,7 +1037,7 @@ router.get('/payment-methods/distribution', async (req, res) => {
       success: true,
       distribution,
       totalBills: bills.length,
-      totalAmount: bills.reduce((sum, bill) => sum + bill.total, 0)
+      totalAmount: bills.reduce((sum, bill) => sum + (bill.total || 0), 0)
     });
   } catch (error) {
     console.error('Error fetching payment methods distribution:', error);
