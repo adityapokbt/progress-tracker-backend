@@ -1,7 +1,7 @@
 // server.js
 require('dotenv').config();
 const express = require('express');
-const mongoose = require('mongoose');
+const { db } = require('./firebase');
 const cors = require('cors');
 
 const app = express();
@@ -82,35 +82,8 @@ app.get('/api/test', (req, res) => {
   });
 });
 
-// MongoDB Connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/pos-saas';
-console.log('Connecting to MongoDB:', MONGODB_URI);
-
-mongoose.connect(MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 30000,
-  socketTimeoutMS: 45000,
-})
-.then(() => console.log('MongoDB connected successfully'))
-.catch(err => {
-  console.error('MongoDB connection error:', err);
-  console.log('Please make sure MongoDB is running on your system');
-  console.log('You can start MongoDB with: mongod');
-});
-
-// MongoDB Connection Event Handlers
-mongoose.connection.on('connected', () => {
-  console.log('MongoDB connected successfully');
-});
-
-mongoose.connection.on('error', (err) => {
-  console.error('MongoDB connection error:', err);
-});
-
-mongoose.connection.on('disconnected', () => {
-  console.log('MongoDB disconnected');
-});
+// Firebase Firestore
+console.log('Firebase Firestore initialized for project:', process.env.FIREBASE_PROJECT_ID);
 
 // Import routes (added staffRoutes)
 
@@ -145,7 +118,7 @@ app.get('/api/health', (req, res) => {
     status: 'OK',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    database: db ? 'connected' : 'disconnected',
     memoryUsage: process.memoryUsage(),
     environment: process.env.NODE_ENV || 'development'
   };
@@ -156,28 +129,14 @@ app.get('/api/health', (req, res) => {
 // Database status endpoint
 app.get('/api/db-status', (req, res) => {
   const dbStatus = {
-    connected: mongoose.connection.readyState === 1,
-    host: mongoose.connection.host,
-    port: mongoose.connection.port,
-    name: mongoose.connection.name,
-    readyState: mongoose.connection.readyState,
-    readyStateDescription: getReadyStateDescription(mongoose.connection.readyState)
+    connected: !!db,
+    provider: 'firebase',
+    projectId: process.env.FIREBASE_PROJECT_ID || null,
+    readyStateDescription: db ? 'connected' : 'disconnected'
   };
   
   res.status(200).json(dbStatus);
 });
-
-// Helper function for ready state description
-function getReadyStateDescription(state) {
-  const states = {
-    0: 'disconnected',
-    1: 'connected',
-    2: 'connecting',
-    3: 'disconnecting',
-    99: 'uninitialized'
-  };
-  return states[state] || 'unknown';
-}
 
 // 404 handler for API routes
 app.use('/api/*', (req, res) => {
@@ -245,14 +204,6 @@ app.use((err, req, res, next) => {
     });
   }
 
-  // MongoDB timeout errors
-  if (err.name === 'MongoServerSelectionError' || err.name === 'MongoTimeoutError') {
-    return res.status(503).json({ 
-      status: 'error', 
-      message: 'Database connection timeout. Please try again.' 
-    });
-  }
-
   // CORS errors
   if (err.message === 'Not allowed by CORS') {
     return res.status(403).json({ 
@@ -269,7 +220,7 @@ app.use((err, req, res, next) => {
 });
 
 // Server listen
-const PORT = process.env.PORT || 5002;
+const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, () => {
   console.log(`\n=== POS SaaS Server Started ===`);
   console.log(`Server running on port ${PORT}`);
@@ -294,14 +245,8 @@ const gracefulShutdown = async (signal) => {
     
     console.log('HTTP server closed.');
     
-    try {
-      await mongoose.connection.close();
-      console.log('MongoDB connection closed');
-      process.exit(0);
-    } catch (dbError) {
-      console.error('Error closing MongoDB connection:', dbError);
-      process.exit(1);
-    }
+    console.log('Firebase connection closed');
+    process.exit(0);
   });
 };
 

@@ -220,7 +220,7 @@ router.get('/low-stock', auth, async (req, res) => {
   try {
     const lowStockProducts = await Product.find({
       store: req.user._id,
-      stock: { $lte: mongoose.Schema.Types.Mixed, $ne: 0 }, // Incorrect syntax
+      stock: { $ne: 0 },
       $expr: { $lte: ['$stock', '$lowStockAlert'] }
     });
     res.status(200).json({

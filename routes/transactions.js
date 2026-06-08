@@ -1,6 +1,7 @@
 // transaction routes (with added /pending-payments route)
 const express = require('express');
-const mongoose = require('mongoose');
+const { mongooseCompat } = require('../utils/firestoreModel');
+const mongoose = mongooseCompat;
 const auth = require('../middleware/auth');
 const SupplierTransaction = require('../models/SupplierTransaction');
 const Supplier = require('../models/Supplier');
