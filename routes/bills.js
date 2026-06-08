@@ -2,15 +2,14 @@
 const express = require('express');
 const router = express.Router();
 const PDFDocument = require('pdfkit');
-const Bill = require('../models/Bill');
-const Product = require('../models/Product');
-const PaymentRecord = require('../models/PaymentRecord');
+const auth = require('../middleware/auth');
+const { db } = require('../firebase');
+const { FieldValue } = require('firebase-admin/firestore');
 
 // Helper function to generate PDF bill
 const generateBillPDF = async (bill) => {
   return new Promise((resolve, reject) => {
     try {
-      // Create PDF document with buffer support
       const doc = new PDFDocument({
         size: 'A4',
         margins: { top: 50, bottom: 50, left: 50, right: 50 },
@@ -23,45 +22,25 @@ const generateBillPDF = async (bill) => {
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
       
-      // Header
-      doc.fontSize(20)
-         .font('Helvetica-Bold')
-         .text('INVOICE', { align: 'center' });
+      doc.fontSize(20).font('Helvetica-Bold').text('INVOICE', { align: 'center' });
+      doc.moveDown();
+      
+      doc.fontSize(10).font('Helvetica')
+        .text(`Bill Number: ${bill.billNumber}`, { continued: true })
+        .text(`Date: ${new Date(bill.createdAt).toLocaleString()}`, { align: 'right' });
       
       doc.moveDown();
       
-      // Bill Info
-      doc.fontSize(10)
-         .font('Helvetica')
-         .text(`Bill Number: ${bill.billNumber}`, { continued: true })
-         .text(`Date: ${new Date(bill.createdAt).toLocaleString()}`, { align: 'right' });
-      
-      doc.moveDown();
-      
-      // Customer Info
       if (bill.customer && bill.customer.name) {
-        doc.fontSize(12)
-           .font('Helvetica-Bold')
-           .text('Customer Information');
-        
-        doc.fontSize(10)
-           .font('Helvetica')
-           .text(`Name: ${bill.customer.name || 'N/A'}`)
-           .text(`Phone: ${bill.customer.phone || 'N/A'}`);
-        
+        doc.fontSize(12).font('Helvetica-Bold').text('Customer Information');
+        doc.fontSize(10).font('Helvetica')
+          .text(`Name: ${bill.customer.name || 'N/A'}`)
+          .text(`Phone: ${bill.customer.phone || 'N/A'}`);
         doc.moveDown();
       }
       
-      // Items Table Header
-      doc.fontSize(10)
-         .font('Helvetica-Bold');
-      
-      const startX = doc.x;
-      const col1 = 50;
-      const col2 = 250;
-      const col3 = 350;
-      const col4 = 450;
-      const col5 = 500;
+      doc.fontSize(10).font('Helvetica-Bold');
+      const col1 = 50, col2 = 250, col3 = 350, col5 = 500;
       
       doc.text('Item', col1, doc.y);
       doc.text('Qty', col2, doc.y);
@@ -69,15 +48,9 @@ const generateBillPDF = async (bill) => {
       doc.text('Total', col5, doc.y);
       
       doc.moveDown();
-      doc.strokeColor('#000000')
-         .lineWidth(0.5)
-         .moveTo(50, doc.y)
-         .lineTo(550, doc.y)
-         .stroke();
-      
+      doc.strokeColor('#000000').lineWidth(0.5).moveTo(50, doc.y).lineTo(550, doc.y).stroke();
       doc.moveDown(0.5);
       
-      // Items
       doc.font('Helvetica');
       let totalAmount = 0;
       
@@ -92,25 +65,14 @@ const generateBillPDF = async (bill) => {
         doc.moveDown();
       });
       
-      // Total Line
       doc.moveDown();
-      doc.strokeColor('#000000')
-         .lineWidth(0.5)
-         .moveTo(50, doc.y)
-         .lineTo(550, doc.y)
-         .stroke();
-      
+      doc.strokeColor('#000000').lineWidth(0.5).moveTo(50, doc.y).lineTo(550, doc.y).stroke();
       doc.moveDown(0.5);
-      doc.font('Helvetica-Bold')
-         .text(`Total: ₹${totalAmount.toFixed(2)}`, 450, doc.y);
-      
+      doc.font('Helvetica-Bold').text(`Total: ₹${totalAmount.toFixed(2)}`, 450, doc.y);
       doc.moveDown();
       
-      // Payment Information
       if (bill.payment) {
-        doc.font('Helvetica-Bold')
-           .text('Payment Information');
-        
+        doc.font('Helvetica-Bold').text('Payment Information');
         doc.font('Helvetica');
         doc.text(`Payment Type: ${bill.payment.type || 'N/A'}`);
         
@@ -122,19 +84,14 @@ const generateBillPDF = async (bill) => {
         }
         
         if (bill.payment.outstandingAmount > 0) {
-          doc.font('Helvetica-Bold')
-             .fillColor('red')
-             .text(`Outstanding Amount: ₹${bill.payment.outstandingAmount.toFixed(2)}`)
-             .fillColor('black');
+          doc.font('Helvetica-Bold').fillColor('red')
+            .text(`Outstanding Amount: ₹${bill.payment.outstandingAmount.toFixed(2)}`)
+            .fillColor('black');
         }
       }
       
-      // Footer
       doc.moveDown(2);
-      doc.fontSize(8)
-         .font('Helvetica')
-         .text('Thank you for your business!', { align: 'center' });
-      
+      doc.fontSize(8).font('Helvetica').text('Thank you for your business!', { align: 'center' });
       doc.end();
       
     } catch (error) {
@@ -143,62 +100,687 @@ const generateBillPDF = async (bill) => {
   });
 };
 
-// Get all credit customers with their bills
-router.get('/credit/customers', async (req, res) => {
-  try {
-    const creditBills = await Bill.find({ 
-      'payment.type': { $in: ['single', 'split'] },
-      'payment.methods': { $elemMatch: { method: 'credit' } },
-      'customer.phone': { $exists: true, $ne: null }
-    }).sort({ createdAt: -1 });
+// Helper function to get next bill number
+const getNextBillNumber = async (storeId) => {
+  const billsRef = db.collection('bills');
+  const snapshot = await billsRef
+    .where('store', '==', storeId)
+    .orderBy('billNumber', 'desc')
+    .limit(1)
+    .get();
+  
+  if (snapshot.empty) {
+    return 1;
+  }
+  
+  const lastBill = snapshot.docs[0].data();
+  return lastBill.billNumber + 1;
+};
 
-    const customersMap = new Map();
+// ==================== DASHBOARD STATS ROUTES (Must come before /:id) ====================
+
+// Get top spender this month
+router.get('/customers/top-spender-this-month', auth, async (req, res) => {
+  try {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    endOfMonth.setHours(23, 59, 59, 999);
     
-    creditBills.forEach(bill => {
-      const customerKey = bill.customer.phone;
-      
-      if (!customersMap.has(customerKey)) {
-        customersMap.set(customerKey, {
-          id: bill.customer.id,
-          name: bill.customer.name,
-          phone: bill.customer.phone,
-          bills: [],
-          totalDue: 0
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .where('createdAt', '>=', startOfMonth)
+      .where('createdAt', '<=', endOfMonth)
+      .get();
+    
+    const customerSpending = new Map();
+    
+    snapshot.forEach(doc => {
+      const bill = doc.data();
+      if (bill.customer && bill.customer.phone) {
+        const phone = bill.customer.phone;
+        const currentSpent = customerSpending.get(phone) || 0;
+        customerSpending.set(phone, {
+          name: bill.customer.name || 'Unknown',
+          phone: phone,
+          totalSpent: currentSpent + (bill.total || 0)
         });
       }
-      
-      const customer = customersMap.get(customerKey);
-      const outstandingAmount = bill.payment.outstandingAmount || 0;
-      
-      customer.bills.push({
-        ...bill.toObject(),
-        outstandingAmount: outstandingAmount
-      });
-      customer.totalDue += outstandingAmount;
     });
-
+    
+    let topSpender = null;
+    for (const customer of customerSpending.values()) {
+      if (!topSpender || customer.totalSpent > topSpender.totalSpent) {
+        topSpender = customer;
+      }
+    }
+    
     res.json({
       success: true,
-      customers: Array.from(customersMap.values())
+      name: topSpender?.name || '',
+      phone: topSpender?.phone || ''
     });
   } catch (error) {
-    console.error('Error fetching credit customers:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to fetch credit customers' 
+    console.error('Error fetching top spender:', error);
+    res.json({ success: true, name: '', phone: '' });
+  }
+});
+
+// Get new customers this month
+router.get('/customers/new-this-month', auth, async (req, res) => {
+  try {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    endOfMonth.setHours(23, 59, 59, 999);
+    
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .where('createdAt', '>=', startOfMonth)
+      .where('createdAt', '<=', endOfMonth)
+      .get();
+    
+    const customerFirstPurchase = new Map();
+    
+    snapshot.forEach(doc => {
+      const bill = doc.data();
+      if (bill.customer && bill.customer.phone) {
+        const phone = bill.customer.phone;
+        let billDate;
+        if (bill.createdAt && typeof bill.createdAt.toDate === 'function') {
+          billDate = bill.createdAt.toDate();
+        } else {
+          billDate = new Date(bill.createdAt);
+        }
+        
+        if (!customerFirstPurchase.has(phone)) {
+          customerFirstPurchase.set(phone, billDate);
+        } else {
+          const existingDate = customerFirstPurchase.get(phone);
+          if (billDate < existingDate) {
+            customerFirstPurchase.set(phone, billDate);
+          }
+        }
+      }
+    });
+    
+    let newCustomers = 0;
+    for (const firstPurchaseDate of customerFirstPurchase.values()) {
+      if (firstPurchaseDate >= startOfMonth && firstPurchaseDate <= endOfMonth) {
+        newCustomers++;
+      }
+    }
+    
+    res.json({ success: true, count: newCustomers });
+  } catch (error) {
+    console.error('Error fetching new customers:', error);
+    res.json({ success: true, count: 0 });
+  }
+});
+
+// Get returning customers percentage
+router.get('/customers/returning-percentage', auth, async (req, res) => {
+  try {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    endOfMonth.setHours(23, 59, 59, 999);
+    
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .where('createdAt', '>=', startOfMonth)
+      .where('createdAt', '<=', endOfMonth)
+      .get();
+    
+    const thisMonthCustomers = new Set();
+    snapshot.forEach(doc => {
+      const bill = doc.data();
+      if (bill.customer && bill.customer.phone) {
+        thisMonthCustomers.add(bill.customer.phone);
+      }
+    });
+    
+    if (thisMonthCustomers.size === 0) {
+      return res.json({ success: true, percentage: 0 });
+    }
+    
+    // Get all bills for these customers to check first purchase date
+    const allBillsRef = db.collection('bills');
+    const allSnapshot = await allBillsRef
+      .where('store', '==', req.user.id)
+      .get();
+    
+    const customerFirstPurchase = new Map();
+    
+    allSnapshot.forEach(doc => {
+      const bill = doc.data();
+      if (bill.customer && bill.customer.phone && thisMonthCustomers.has(bill.customer.phone)) {
+        const phone = bill.customer.phone;
+        let billDate;
+        if (bill.createdAt && typeof bill.createdAt.toDate === 'function') {
+          billDate = bill.createdAt.toDate();
+        } else {
+          billDate = new Date(bill.createdAt);
+        }
+        
+        if (!customerFirstPurchase.has(phone)) {
+          customerFirstPurchase.set(phone, billDate);
+        } else {
+          const existingDate = customerFirstPurchase.get(phone);
+          if (billDate < existingDate) {
+            customerFirstPurchase.set(phone, billDate);
+          }
+        }
+      }
+    });
+    
+    let returningCount = 0;
+    for (const firstPurchaseDate of customerFirstPurchase.values()) {
+      if (firstPurchaseDate < startOfMonth) {
+        returningCount++;
+      }
+    }
+    
+    const percentage = Math.round((returningCount / thisMonthCustomers.size) * 100);
+    
+    res.json({ success: true, percentage });
+  } catch (error) {
+    console.error('Error fetching returning percentage:', error);
+    res.json({ success: true, percentage: 0 });
+  }
+});
+
+// Get credit customers count
+router.get('/customers/credit-count', auth, async (req, res) => {
+  try {
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .get();
+    
+    const creditCustomers = new Set();
+    
+    snapshot.forEach(doc => {
+      const bill = doc.data();
+      if (bill.payment && bill.payment.methods && bill.customer && bill.customer.phone) {
+        const hasCredit = bill.payment.methods.some(method => method.method === 'credit');
+        if (hasCredit) {
+          creditCustomers.add(bill.customer.phone);
+        }
+      }
+    });
+    
+    res.json({ success: true, count: creditCustomers.size });
+  } catch (error) {
+    console.error('Error fetching credit count:', error);
+    res.json({ success: true, count: 0 });
+  }
+});
+
+// Get today's top products
+router.get('/sales/today/products', auth, async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .where('createdAt', '>=', today)
+      .where('createdAt', '<', tomorrow)
+      .get();
+    
+    const productSales = new Map();
+    let totalQuantitySold = 0;
+    
+    snapshot.forEach(doc => {
+      const bill = doc.data();
+      if (bill.items && Array.isArray(bill.items)) {
+        bill.items.forEach(item => {
+          const productName = item.name || item.productName || 'Unknown';
+          if (productSales.has(productName)) {
+            const existing = productSales.get(productName);
+            existing.quantity += item.quantity;
+            productSales.set(productName, existing);
+          } else {
+            productSales.set(productName, {
+              name: productName,
+              category: item.category || 'Uncategorized',
+              quantity: item.quantity
+            });
+          }
+          totalQuantitySold += item.quantity;
+        });
+      }
+    });
+    
+    const bestSellers = Array.from(productSales.values())
+      .sort((a, b) => b.quantity - a.quantity)
+      .slice(0, 5);
+    
+    const worstSeller = Array.from(productSales.values())
+      .sort((a, b) => a.quantity - b.quantity)[0] || null;
+    
+    res.json({
+      success: true,
+      bestSellers,
+      worstSeller,
+      totalQuantitySold
+    });
+  } catch (error) {
+    console.error('Error fetching today\'s top products:', error);
+    res.json({
+      success: true,
+      bestSellers: [],
+      worstSeller: null,
+      totalQuantitySold: 0
     });
   }
 });
 
-// Generate PDF for a bill
-router.get('/:billNumber/pdf', async (req, res) => {
+// Get today's sales summary
+router.get('/sales/today', auth, async (req, res) => {
   try {
-    const bill = await Bill.findOne({ billNumber: req.params.billNumber });
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
     
-    if (!bill) {
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .where('createdAt', '>=', today)
+      .where('createdAt', '<', tomorrow)
+      .get();
+    
+    let totalSales = 0;
+    const bills = [];
+    
+    snapshot.forEach(doc => {
+      const bill = doc.data();
+      totalSales += bill.total || 0;
+      bills.push({ id: doc.id, ...bill });
+    });
+    
+    res.json({
+      success: true,
+      totalSales,
+      billsCount: snapshot.size,
+      bills
+    });
+  } catch (error) {
+    console.error('Error fetching today\'s sales:', error);
+    res.json({ success: true, totalSales: 0, billsCount: 0, bills: [] });
+  }
+});
+
+// Get yesterday's sales
+router.get('/sales/yesterday', auth, async (req, res) => {
+  try {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    yesterday.setHours(0, 0, 0, 0);
+    
+    const today = new Date(yesterday);
+    today.setDate(today.getDate() + 1);
+    
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .where('createdAt', '>=', yesterday)
+      .where('createdAt', '<', today)
+      .get();
+    
+    let totalSales = 0;
+    snapshot.forEach(doc => {
+      totalSales += doc.data().total || 0;
+    });
+    
+    res.json({
+      success: true,
+      totalSales,
+      billsCount: snapshot.size
+    });
+  } catch (error) {
+    console.error('Error fetching yesterday\'s sales:', error);
+    res.json({ success: true, totalSales: 0, billsCount: 0 });
+  }
+});
+
+// Get last 7 days sales
+router.get('/sales/last7days', auth, async (req, res) => {
+  try {
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
+    sevenDaysAgo.setHours(0, 0, 0, 0);
+    
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+    
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .where('createdAt', '>=', sevenDaysAgo)
+      .where('createdAt', '<', tomorrow)
+      .get();
+    
+    const daysOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const salesByDay = {};
+    
+    daysOfWeek.forEach(day => { salesByDay[day] = 0; });
+    
+    snapshot.forEach(doc => {
+      const bill = doc.data();
+      let billDate;
+      if (bill.createdAt && typeof bill.createdAt.toDate === 'function') {
+        billDate = bill.createdAt.toDate();
+      } else {
+        billDate = new Date(bill.createdAt);
+      }
+      const dayName = daysOfWeek[billDate.getDay()];
+      salesByDay[dayName] += bill.total || 0;
+    });
+    
+    const last7DaysSales = daysOfWeek.map(day => salesByDay[day]);
+    
+    res.json({
+      success: true,
+      last7DaysSales,
+      daysOfWeek
+    });
+  } catch (error) {
+    console.error('Error fetching last 7 days sales:', error);
+    res.json({ success: true, last7DaysSales: [0, 0, 0, 0, 0, 0, 0], daysOfWeek: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'] });
+  }
+});
+
+// Get today's profit
+router.get('/profit/today', auth, async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .where('createdAt', '>=', today)
+      .where('createdAt', '<', tomorrow)
+      .get();
+    
+    let totalRevenue = 0;
+    let totalCost = 0;
+    let totalProfit = 0;
+    let itemsSold = 0;
+
+    for (const doc of snapshot.docs) {
+      const bill = doc.data();
+      
+      for (const item of bill.items) {
+        const itemRevenue = item.price * item.quantity;
+        const itemCost = (item.costPrice || item.price * 0.7) * item.quantity;
+        
+        totalRevenue += itemRevenue;
+        totalCost += itemCost;
+        totalProfit += (itemRevenue - itemCost);
+        itemsSold += item.quantity;
+      }
+    }
+
+    res.json({
+      success: true,
+      profitData: {
+        totalRevenue: Math.round(totalRevenue * 100) / 100,
+        totalCost: Math.round(totalCost * 100) / 100,
+        totalProfit: Math.round(totalProfit * 100) / 100,
+        itemsSold: itemsSold,
+        billsCount: snapshot.size,
+        profitMargin: totalRevenue > 0 ? Math.round((totalProfit / totalRevenue) * 100 * 100) / 100 : 0,
+        date: today.toISOString().split('T')[0]
+      }
+    });
+  } catch (error) {
+    console.error('Error calculating today\'s profit:', error);
+    res.json({
+      success: true,
+      profitData: {
+        totalRevenue: 0,
+        totalCost: 0,
+        totalProfit: 0,
+        itemsSold: 0,
+        billsCount: 0,
+        profitMargin: 0,
+        date: new Date().toISOString().split('T')[0]
+      }
+    });
+  }
+});
+
+// Get profit for date range
+router.get('/profit/range', auth, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        error: 'Start date and end date are required'
+      });
+    }
+
+    const start = new Date(startDate);
+    start.setHours(0, 0, 0, 0);
+    
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59, 999);
+
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .where('createdAt', '>=', start)
+      .where('createdAt', '<=', end)
+      .get();
+    
+    let totalRevenue = 0;
+    let totalCost = 0;
+    let totalProfit = 0;
+    let itemsSold = 0;
+
+    for (const doc of snapshot.docs) {
+      const bill = doc.data();
+      
+      for (const item of bill.items) {
+        const itemRevenue = item.price * item.quantity;
+        const itemCost = (item.costPrice || item.price * 0.7) * item.quantity;
+        
+        totalRevenue += itemRevenue;
+        totalCost += itemCost;
+        totalProfit += (itemRevenue - itemCost);
+        itemsSold += item.quantity;
+      }
+    }
+
+    res.json({
+      success: true,
+      profitData: {
+        totalRevenue: Math.round(totalRevenue * 100) / 100,
+        totalCost: Math.round(totalCost * 100) / 100,
+        totalProfit: Math.round(totalProfit * 100) / 100,
+        itemsSold: itemsSold,
+        billsCount: snapshot.size,
+        profitMargin: totalRevenue > 0 ? Math.round((totalProfit / totalRevenue) * 100 * 100) / 100 : 0,
+        startDate: start,
+        endDate: end
+      }
+    });
+  } catch (error) {
+    console.error('Error calculating profit for date range:', error);
+    res.json({
+      success: true,
+      profitData: {
+        totalRevenue: 0,
+        totalCost: 0,
+        totalProfit: 0,
+        itemsSold: 0,
+        billsCount: 0,
+        profitMargin: 0,
+        startDate: startDate,
+        endDate: endDate
+      }
+    });
+  }
+});
+
+// Get next bill number
+router.get('/next-number', auth, async (req, res) => {
+  try {
+    const nextBillNumber = await getNextBillNumber(req.user.id);
+    res.json({ success: true, nextBillNumber });
+  } catch (error) {
+    console.error('Error getting next bill number:', error);
+    res.json({ success: true, nextBillNumber: 1 });
+  }
+});
+
+// Create a new bill
+router.post('/', auth, async (req, res) => {
+  try {
+    const billData = req.body;
+    
+    // Validate payment data
+    if (billData.payment && billData.payment.type === 'split') {
+      const totalMethodAmount = billData.payment.methods.reduce((sum, method) => sum + (method.amount || 0), 0);
+      const totalPaidWithOutstanding = (billData.payment.totalPaid || 0) + (billData.payment.outstandingAmount || 0);
+      
+      if (Math.abs(totalMethodAmount - totalPaidWithOutstanding) > 0.01) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Total paid amount plus outstanding amount must equal sum of payment method amounts' 
+        });
+      }
+    }
+    
+    const nextBillNumber = await getNextBillNumber(req.user.id);
+    
+    const newBill = {
+      billNumber: nextBillNumber,
+      store: req.user.id,
+      ...billData,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+    
+    const billsRef = db.collection('bills');
+    const docRef = await billsRef.add(newBill);
+    
+    // Update product stock
+    if (billData.items && Array.isArray(billData.items)) {
+      for (const item of billData.items) {
+        if (item.productId) {
+          const productRef = db.collection('products').doc(item.productId);
+          const productDoc = await productRef.get();
+          if (productDoc.exists) {
+            await productRef.update({
+              stock: FieldValue.increment(-item.quantity)
+            });
+          }
+        }
+      }
+    }
+    
+    const savedBill = await docRef.get();
+    
+    res.json({ success: true, bill: { id: savedBill.id, ...savedBill.data() } });
+  } catch (error) {
+    console.error('Error creating bill:', error);
+    res.status(500).json({ success: false, error: 'Failed to create bill' });
+  }
+});
+
+// Get all bills with pagination
+router.get('/', auth, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .orderBy('createdAt', 'desc')
+      .limit(limit)
+      .get();
+    
+    const totalSnapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .get();
+    const total = totalSnapshot.size;
+    
+    const bills = [];
+    snapshot.forEach(doc => {
+      bills.push({ id: doc.id, ...doc.data() });
+    });
+    
+    res.json({
+      success: true,
+      bills,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching bills:', error);
+    res.json({ success: true, bills: [], pagination: { page: 1, limit: 20, total: 0, pages: 0 } });
+  }
+});
+
+// Get specific bill by billNumber
+router.get('/bill-number/:billNumber', auth, async (req, res) => {
+  try {
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .where('billNumber', '==', parseInt(req.params.billNumber))
+      .limit(1)
+      .get();
+    
+    if (snapshot.empty) {
       return res.status(404).json({ success: false, error: 'Bill not found' });
     }
     
+    const bill = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
+    res.json({ success: true, bill });
+  } catch (error) {
+    console.error('Error fetching bill:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch bill' });
+  }
+});
+
+// Generate PDF for a bill
+router.get('/:billNumber/pdf', auth, async (req, res) => {
+  try {
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .where('billNumber', '==', parseInt(req.params.billNumber))
+      .limit(1)
+      .get();
+    
+    if (snapshot.empty) {
+      return res.status(404).json({ success: false, error: 'Bill not found' });
+    }
+    
+    const bill = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
     const pdfBuffer = await generateBillPDF(bill);
     
     res.setHeader('Content-Type', 'application/pdf');
@@ -208,113 +790,243 @@ router.get('/:billNumber/pdf', async (req, res) => {
     res.send(pdfBuffer);
   } catch (error) {
     console.error('Error generating PDF:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to generate PDF' 
-    });
+    res.status(500).json({ success: false, error: 'Failed to generate PDF' });
   }
 });
 
-// Process payment for a bill or customer (supports split payments)
-router.post('/credit/process-payment', async (req, res) => {
+// Get bill by ID (MUST BE LAST - after all specific routes)
+router.get('/:id', auth, async (req, res) => {
   try {
-    const { 
-      customerPhone, 
-      billId, 
-      payments, // Array of { method, amount, transactionId }
-      newOutstandingAmount 
-    } = req.body;
+    const billRef = db.collection('bills').doc(req.params.id);
+    const billDoc = await billRef.get();
+    
+    if (!billDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Bill not found' });
+    }
+    
+    const bill = billDoc.data();
+    if (bill.store !== req.user.id) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+    
+    res.json({ success: true, bill: { id: billDoc.id, ...bill } });
+  } catch (error) {
+    console.error('Error fetching bill:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch bill' });
+  }
+});
 
-    if (newOutstandingAmount !== undefined) {
-      const bill = await Bill.findById(billId);
-      if (!bill) {
+// Delete a bill
+router.delete('/:id', auth, async (req, res) => {
+  try {
+    const billRef = db.collection('bills').doc(req.params.id);
+    const billDoc = await billRef.get();
+    
+    if (!billDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Bill not found' });
+    }
+    
+    const bill = billDoc.data();
+    if (bill.store !== req.user.id) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+    
+    // Restore product stock
+    if (bill.items && Array.isArray(bill.items)) {
+      for (const item of bill.items) {
+        if (item.productId) {
+          const productRef = db.collection('products').doc(item.productId);
+          await productRef.update({
+            stock: FieldValue.increment(item.quantity)
+          });
+        }
+      }
+    }
+    
+    await billRef.delete();
+    
+    res.json({ success: true, message: 'Bill deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting bill:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete bill' });
+  }
+});
+
+// Get all credit customers with their bills
+router.get('/credit/customers', auth, async (req, res) => {
+  try {
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .get();
+    
+    const customersMap = new Map();
+    
+    snapshot.forEach(doc => {
+      const bill = { id: doc.id, ...doc.data() };
+      
+      if (bill.customer && bill.customer.phone && bill.payment && bill.payment.methods) {
+        const hasCredit = bill.payment.methods.some(method => method.method === 'credit');
+        
+        if (hasCredit) {
+          const customerKey = bill.customer.phone;
+          
+          if (!customersMap.has(customerKey)) {
+            customersMap.set(customerKey, {
+              id: bill.customer.id,
+              name: bill.customer.name,
+              phone: bill.customer.phone,
+              bills: [],
+              totalDue: 0
+            });
+          }
+          
+          const customer = customersMap.get(customerKey);
+          const outstandingAmount = bill.payment?.outstandingAmount || 0;
+          
+          customer.bills.push({ ...bill, outstandingAmount });
+          customer.totalDue += outstandingAmount;
+        }
+      }
+    });
+
+    res.json({
+      success: true,
+      customers: Array.from(customersMap.values())
+    });
+  } catch (error) {
+    console.error('Error fetching credit customers:', error);
+    res.json({ success: true, customers: [] });
+  }
+});
+
+// Process payment for a bill or customer
+router.post('/credit/process-payment', auth, async (req, res) => {
+  try {
+    const { customerPhone, billId, payments, newOutstandingAmount } = req.body;
+
+    if (newOutstandingAmount !== undefined && billId) {
+      const billRef = db.collection('bills').doc(billId);
+      const billDoc = await billRef.get();
+      
+      if (!billDoc.exists) {
         return res.status(404).json({ success: false, error: 'Bill not found' });
       }
+      
+      const bill = billDoc.data();
+      if (bill.store !== req.user.id) {
+        return res.status(403).json({ success: false, error: 'Access denied' });
+      }
 
-      bill.payment.outstandingAmount = parseFloat(newOutstandingAmount);
-      await bill.save();
+      await billRef.update({
+        'payment.outstandingAmount': parseFloat(newOutstandingAmount),
+        updatedAt: new Date()
+      });
 
+      const updatedBill = await billRef.get();
+      
       return res.json({ 
         success: true, 
         message: 'Bill outstanding amount updated successfully',
-        bill: bill
+        bill: { id: updatedBill.id, ...updatedBill.data() }
       });
     }
 
     if (billId) {
-      const bill = await Bill.findById(billId);
-      if (!bill) {
+      const billRef = db.collection('bills').doc(billId);
+      const billDoc = await billRef.get();
+      
+      if (!billDoc.exists) {
         return res.status(404).json({ success: false, error: 'Bill not found' });
       }
-
-      const currentOutstanding = bill.payment.outstandingAmount || bill.total;
+      
+      const bill = { id: billDoc.id, ...billDoc.data() };
+      if (bill.store !== req.user.id) {
+        return res.status(403).json({ success: false, error: 'Access denied' });
+      }
+      
+      const currentOutstanding = bill.payment?.outstandingAmount || bill.total;
       const totalPaid = payments.reduce((sum, p) => sum + parseFloat(p.amount), 0);
 
       if (totalPaid > currentOutstanding) {
         return res.status(400).json({ success: false, error: 'Payment amount exceeds outstanding balance' });
       }
 
-      // Update total paid and outstanding amount
-      bill.payment.totalPaid = (bill.payment.totalPaid || 0) + totalPaid;
-      bill.payment.outstandingAmount = currentOutstanding - totalPaid;
-
-      // Initialize payment methods if empty
-      if (!bill.payment.methods) {
-        bill.payment.methods = [];
-      }
-
-      // Add new payment methods
+      const newTotalPaid = (bill.payment?.totalPaid || 0) + totalPaid;
+      const newOutstanding = currentOutstanding - totalPaid;
+      
+      let methods = bill.payment?.methods || [];
+      
       const newPayments = payments.map(p => ({
         method: p.method,
         amount: parseFloat(p.amount),
-        transactionId: p.transactionId || ''
+        transactionId: p.transactionId || '',
+        date: new Date()
       }));
-
-      // If there's an outstanding amount, add it as a credit payment method
-      if (bill.payment.outstandingAmount > 0) {
-        // Remove any existing credit payment methods to avoid duplication
-        bill.payment.methods = bill.payment.methods.filter(p => p.method !== 'credit');
-        // Add the remaining balance as a credit payment method
-        bill.payment.methods.push({
+      
+      if (newOutstanding > 0) {
+        methods = methods.filter(p => p.method !== 'credit');
+        methods.push({
           method: 'credit',
-          amount: bill.payment.outstandingAmount,
-          transactionId: ''
+          amount: newOutstanding,
+          transactionId: '',
+          date: new Date()
         });
       }
-
-      // Update payment type
-      bill.payment.type = newPayments.length > 1 || bill.payment.outstandingAmount > 0 ? 'split' : 'single';
-      bill.payment.methods.push(...newPayments);
-
-      await bill.save();
+      
+      methods.push(...newPayments);
+      
+      await billRef.update({
+        'payment.totalPaid': newTotalPaid,
+        'payment.outstandingAmount': newOutstanding,
+        'payment.methods': methods,
+        'payment.type': newPayments.length > 1 || newOutstanding > 0 ? 'split' : 'single',
+        updatedAt: new Date()
+      });
 
       // Create payment records for non-credit payments
+      const paymentsRef = db.collection('paymentRecords');
       for (const payment of newPayments) {
         if (payment.method !== 'credit') {
-          await PaymentRecord.create({
-            billId: bill._id,
+          await paymentsRef.add({
+            billId: billId,
             customerPhone: customerPhone,
             amount: payment.amount,
             paymentMethod: payment.method,
             transactionId: payment.transactionId,
             paymentDate: new Date(),
-            isPartial: bill.payment.outstandingAmount > 0
+            isPartial: newOutstanding > 0,
+            store: req.user.id,
+            createdAt: new Date()
           });
         }
       }
 
+      const updatedBill = await billRef.get();
+      
       return res.json({ 
         success: true, 
         message: 'Payment processed successfully',
-        bill
+        bill: { id: updatedBill.id, ...updatedBill.data() }
       });
     } else if (customerPhone) {
-      const customerBills = await Bill.find({ 
-        'customer.phone': customerPhone, 
-        'payment.outstandingAmount': { $gt: 0 }
+      const billsRef = db.collection('bills');
+      const snapshot = await billsRef
+        .where('store', '==', req.user.id)
+        .where('customer.phone', '==', customerPhone)
+        .where('payment.outstandingAmount', '>', 0)
+        .get();
+      
+      const customerBills = [];
+      snapshot.forEach(doc => {
+        customerBills.push({ id: doc.id, ...doc.data() });
       });
+      
+      if (customerBills.length === 0) {
+        return res.json({ success: true, message: 'No outstanding bills found' });
+      }
 
-      const totalDue = customerBills.reduce((sum, bill) => sum + (bill.payment.outstandingAmount || bill.total), 0);
+      const totalDue = customerBills.reduce((sum, bill) => sum + (bill.payment?.outstandingAmount || bill.total), 0);
       const totalPaid = payments.reduce((sum, p) => sum + parseFloat(p.amount), 0);
 
       if (totalPaid > totalDue) {
@@ -322,63 +1034,73 @@ router.post('/credit/process-payment', async (req, res) => {
       }
 
       let remainingPayment = totalPaid;
+      const paymentsRef = db.collection('paymentRecords');
+      
       for (const bill of customerBills) {
-        const currentOutstanding = bill.payment.outstandingAmount || bill.total;
+        if (remainingPayment <= 0) break;
+        
+        const currentOutstanding = bill.payment?.outstandingAmount || bill.total;
         const paymentForBill = Math.min(remainingPayment, currentOutstanding);
+        
         if (paymentForBill <= 0) continue;
-
-        bill.payment.totalPaid = (bill.payment.totalPaid || 0) + paymentForBill;
-        bill.payment.outstandingAmount = currentOutstanding - paymentForBill;
-
-        // Initialize payment methods if empty
-        if (!bill.payment.methods) {
-          bill.payment.methods = [];
-        }
-
-        // Distribute payment across methods
+        
+        const billRef = db.collection('bills').doc(bill.id);
+        const newTotalPaid = (bill.payment?.totalPaid || 0) + paymentForBill;
+        const newOutstanding = currentOutstanding - paymentForBill;
+        
+        let methods = bill.payment?.methods || [];
+        
         let paymentRemaining = paymentForBill;
         const billPaymentMethods = [];
+        
         for (const payment of payments) {
           if (paymentRemaining <= 0) break;
           const amountToUse = Math.min(parseFloat(payment.amount), paymentRemaining);
           billPaymentMethods.push({
             method: payment.method,
             amount: amountToUse,
-            transactionId: payment.transactionId
+            transactionId: payment.transactionId,
+            date: new Date()
           });
           paymentRemaining -= amountToUse;
         }
-
-        // If there's an outstanding amount, add it as a credit payment method
-        if (bill.payment.outstandingAmount > 0) {
-          bill.payment.methods = bill.payment.methods.filter(p => p.method !== 'credit');
-          bill.payment.methods.push({
+        
+        if (newOutstanding > 0) {
+          methods = methods.filter(p => p.method !== 'credit');
+          methods.push({
             method: 'credit',
-            amount: bill.payment.outstandingAmount,
-            transactionId: ''
+            amount: newOutstanding,
+            transactionId: '',
+            date: new Date()
           });
         }
-
-        bill.payment.type = billPaymentMethods.length > 1 || bill.payment.outstandingAmount > 0 ? 'split' : 'single';
-        bill.payment.methods.push(...billPaymentMethods);
-
-        await bill.save();
-
-        // Create payment records for non-credit payments
+        
+        methods.push(...billPaymentMethods);
+        
+        await billRef.update({
+          'payment.totalPaid': newTotalPaid,
+          'payment.outstandingAmount': newOutstanding,
+          'payment.methods': methods,
+          'payment.type': billPaymentMethods.length > 1 || newOutstanding > 0 ? 'split' : 'single',
+          updatedAt: new Date()
+        });
+        
         for (const method of billPaymentMethods) {
           if (method.method !== 'credit') {
-            await PaymentRecord.create({
-              billId: bill._id,
+            await paymentsRef.add({
+              billId: bill.id,
               customerPhone: customerPhone,
               amount: method.amount,
               paymentMethod: method.method,
               transactionId: method.transactionId,
               paymentDate: new Date(),
-              isPartial: bill.payment.outstandingAmount > 0
+              isPartial: newOutstanding > 0,
+              store: req.user.id,
+              createdAt: new Date()
             });
           }
         }
-
+        
         remainingPayment -= paymentForBill;
       }
 
@@ -402,24 +1124,28 @@ router.post('/credit/process-payment', async (req, res) => {
 });
 
 // Update payment for a bill
-router.patch('/:id/payment', async (req, res) => {
+router.patch('/:id/payment', auth, async (req, res) => {
   try {
     const { payment } = req.body;
+    const billRef = db.collection('bills').doc(req.params.id);
+    const billDoc = await billRef.get();
     
-    const bill = await Bill.findByIdAndUpdate(
-      req.params.id,
-      { payment },
-      { new: true, runValidators: true }
-    );
-
-    if (!bill) {
+    if (!billDoc.exists) {
       return res.status(404).json({ success: false, error: 'Bill not found' });
     }
-
+    
+    const bill = billDoc.data();
+    if (bill.store !== req.user.id) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+    
+    await billRef.update({ payment, updatedAt: new Date() });
+    const updatedBill = await billRef.get();
+    
     res.json({ 
       success: true, 
       message: 'Payment updated successfully',
-      bill: bill
+      bill: { id: updatedBill.id, ...updatedBill.data() }
     });
   } catch (error) {
     console.error('Error updating payment:', error);
@@ -430,568 +1156,45 @@ router.patch('/:id/payment', async (req, res) => {
   }
 });
 
-// Get today's profit calculation
-router.get('/profit/today', async (req, res) => {
-  try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    
-    const todayBills = await Bill.find({
-      createdAt: {
-        $gte: today,
-        $lt: tomorrow
-      }
-    });
-
-    let totalRevenue = 0;
-    let totalCost = 0;
-    let totalProfit = 0;
-    let itemsSold = 0;
-
-    for (const bill of todayBills) {
-      for (const item of bill.items) {
-        const product = await Product.findById(item.productId);
-        
-        if (product) {
-          const itemRevenue = item.price * item.quantity;
-          const itemCost = product.cost * item.quantity;
-          const itemProfit = itemRevenue - itemCost;
-          
-          totalRevenue += itemRevenue;
-          totalCost += itemCost;
-          totalProfit += itemProfit;
-          itemsSold += item.quantity;
-        }
-      }
-    }
-
-    res.json({
-      success: true,
-      profitData: {
-        totalRevenue: Math.round(totalRevenue * 100) / 100,
-        totalCost: Math.round(totalCost * 100) / 100,
-        totalProfit: Math.round(totalProfit * 100) / 100,
-        itemsSold: itemsSold,
-        billsCount: todayBills.length,
-        profitMargin: totalRevenue > 0 ? Math.round((totalProfit / totalRevenue) * 100 * 100) / 100 : 0,
-        date: today.toISOString().split('T')[0]
-      }
-    });
-  } catch (error) {
-    console.error('Error calculating today\'s profit:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to calculate today\'s profit' 
-    });
-  }
-});
-
-// Get profit for a specific date range
-router.get('/profit/range', async (req, res) => {
-  try {
-    const { startDate, endDate } = req.query;
-    
-    if (!startDate || !endDate) {
-      return res.status(400).json({
-        success: false,
-        error: 'Start date and end date are required'
-      });
-    }
-
-    const start = new Date(startDate);
-    start.setHours(0, 0, 0, 0);
-    
-    const end = new Date(endDate);
-    end.setHours(23, 59, 59, 999);
-
-    const bills = await Bill.find({
-      createdAt: {
-        $gte: start,
-        $lte: end
-      }
-    });
-
-    let totalRevenue = 0;
-    let totalCost = 0;
-    let totalProfit = 0;
-    let itemsSold = 0;
-
-    for (const bill of bills) {
-      for (const item of bill.items) {
-        const product = await Product.findById(item.productId);
-        
-        if (product) {
-          const itemRevenue = item.price * item.quantity;
-          const itemCost = product.cost * item.quantity;
-          const itemProfit = itemRevenue - itemCost;
-          
-          totalRevenue += itemRevenue;
-          totalCost += itemCost;
-          totalProfit += itemProfit;
-          itemsSold += item.quantity;
-        }
-      }
-    }
-
-    res.json({
-      success: true,
-      profitData: {
-        totalRevenue: Math.round(totalRevenue * 100) / 100,
-        totalCost: Math.round(totalCost * 100) / 100,
-        totalProfit: Math.round(totalProfit * 100) / 100,
-        itemsSold: itemsSold,
-        billsCount: bills.length,
-        profitMargin: totalRevenue > 0 ? Math.round((totalProfit / totalRevenue) * 100 * 100) / 100 : 0,
-        startDate: start,
-        endDate: end
-      }
-    });
-  } catch (error) {
-    console.error('Error calculating profit for date range:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to calculate profit for date range' 
-    });
-  }
-});
-
-// Get next bill number
-router.get('/next-number', async (req, res) => {
-  try {
-    const lastBill = await Bill.findOne().sort({ billNumber: -1 });
-    const nextBillNumber = lastBill ? lastBill.billNumber + 1 : 1;
-    
-    res.json({ success: true, nextBillNumber });
-  } catch (error) {
-    console.error('Error getting next bill number:', error);
-    res.status(500).json({ success: false, error: 'Failed to get next bill number' });
-  }
-});
-
-// Create a new bill (supports split payments)
-router.post('/', async (req, res) => {
-  try {
-    const billData = req.body;
-    
-    // Validate payment data
-    if (billData.payment && billData.payment.type === 'split') {
-      const totalMethodAmount = billData.payment.methods.reduce((sum, method) => sum + (method.amount || 0), 0);
-      const totalPaidWithOutstanding = (billData.payment.totalPaid || 0) + (billData.payment.outstandingAmount || 0);
-      
-      if (Math.abs(totalMethodAmount - totalPaidWithOutstanding) > 0.01) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'Total paid amount plus outstanding amount must equal sum of payment method amounts' 
-        });
-      }
-    }
-
-    const newBill = new Bill(billData);
-    const savedBill = await newBill.save();
-    
-    // Update product stock
-    for (const item of billData.items) {
-      await Product.findByIdAndUpdate(
-        item.productId,
-        { $inc: { stock: -item.quantity } }
-      );
-    }
-    
-    res.json({ success: true, bill: savedBill });
-  } catch (error) {
-    console.error('Error creating bill:', error);
-    res.status(500).json({ success: false, error: 'Failed to create bill' });
-  }
-});
-
-// Get all bills with pagination
-router.get('/', async (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    
-    const bills = await Bill.find()
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
-    
-    const total = await Bill.countDocuments();
-    
-    res.json({
-      success: true,
-      bills,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
-      }
-    });
-  } catch (error) {
-    console.error('Error fetching bills:', error);
-    res.status(500).json({ success: false, error: 'Failed to fetch bills' });
-  }
-});
-
-// Get specific bill by billNumber
-router.get('/:billNumber', async (req, res) => {
-  try {
-    const bill = await Bill.findOne({ billNumber: parseInt(req.params.billNumber) });
-    
-    if (!bill) {
-      return res.status(404).json({ success: false, error: 'Bill not found' });
-    }
-    
-    res.json({ success: true, bill });
-  } catch (error) {
-    console.error('Error fetching bill:', error);
-    res.status(500).json({ success: false, error: 'Failed to fetch bill' });
-  }
-});
-
-// Delete a bill
-router.delete('/:id', async (req, res) => {
-  try {
-    const bill = await Bill.findById(req.params.id);
-    
-    if (!bill) {
-      return res.status(404).json({ success: false, error: 'Bill not found' });
-    }
-    
-    // Restore product stock
-    for (const item of bill.items) {
-      await Product.findByIdAndUpdate(
-        item.productId,
-        { $inc: { stock: item.quantity } }
-      );
-    }
-    
-    await Bill.findByIdAndDelete(req.params.id);
-    
-    res.json({ success: true, message: 'Bill deleted successfully' });
-  } catch (error) {
-    console.error('Error deleting bill:', error);
-    res.status(500).json({ success: false, error: 'Failed to delete bill' });
-  }
-});
-
-// Get today's sales summary
-router.get('/sales/today', async (req, res) => {
-  try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    
-    const todayBills = await Bill.find({
-      createdAt: {
-        $gte: today,
-        $lt: tomorrow
-      }
-    });
-    
-    const totalSales = todayBills.reduce((sum, bill) => sum + bill.total, 0);
-    const billsCount = todayBills.length;
-    
-    res.json({
-      success: true,
-      totalSales,
-      billsCount,
-      bills: todayBills
-    });
-  } catch (error) {
-    console.error('Error fetching today\'s sales:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// Get yesterday's sales for comparison
-router.get('/sales/yesterday', async (req, res) => {
-  try {
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    yesterday.setHours(0, 0, 0, 0);
-    
-    const today = new Date(yesterday);
-    today.setDate(today.getDate() + 1);
-    
-    const yesterdayBills = await Bill.find({
-      createdAt: {
-        $gte: yesterday,
-        $lt: today
-      }
-    });
-    
-    const totalSales = yesterdayBills.reduce((sum, bill) => sum + bill.total, 0);
-    
-    res.json({
-      success: true,
-      totalSales,
-      billsCount: yesterdayBills.length
-    });
-  } catch (error) {
-    console.error('Error fetching yesterday\'s sales:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// Get last 7 days sales for trend graph
-router.get('/sales/last7days', async (req, res) => {
-  try {
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
-    sevenDaysAgo.setHours(0, 0, 0, 0);
-    
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    tomorrow.setHours(0, 0, 0, 0);
-    
-    const bills = await Bill.find({
-      createdAt: {
-        $gte: sevenDaysAgo,
-        $lt: tomorrow
-      }
-    });
-    
-    const salesByDay = {};
-    const daysOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-    
-    for (let i = 0; i < 7; i++) {
-      const date = new Date(sevenDaysAgo);
-      date.setDate(date.getDate() + i);
-      const dayName = daysOfWeek[date.getDay()];
-      salesByDay[dayName] = 0;
-    }
-    
-    bills.forEach(bill => {
-      const dayName = daysOfWeek[bill.createdAt.getDay()];
-      salesByDay[dayName] += bill.total;
-    });
-    
-    const last7DaysSales = daysOfWeek.map(day => salesByDay[day]);
-    
-    res.json({
-      success: true,
-      last7DaysSales,
-      daysOfWeek
-    });
-  } catch (error) {
-    console.error('Error fetching last 7 days sales:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// Get top products by quantity sold today
-router.get('/sales/today/products', async (req, res) => {
-  try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    
-    const bills = await Bill.aggregate([
-      {
-        $match: {
-          createdAt: {
-            $gte: today,
-            $lt: tomorrow
-          }
-        }
-      },
-      { $unwind: '$items' },
-      {
-        $group: {
-          _id: {
-            productId: '$items.productId',
-            name: '$items.name',
-            category: '$items.category'
-          },
-          totalQuantity: { $sum: '$items.quantity' }
-        }
-      },
-      {
-        $sort: { totalQuantity: -1 }
-      }
-    ]);
-    
-    const totalQuantitySold = bills.reduce((sum, item) => sum + item.totalQuantity, 0);
-    
-    const bestSellers = bills.slice(0, 3).map(item => ({
-      productId: item._id.productId,
-      name: item._id.name,
-      category: item._id.category || 'Uncategorized',
-      quantity: item.totalQuantity
-    }));
-    
-    const worstSeller = bills.length > 0 ? {
-      productId: bills[bills.length - 1]._id.productId,
-      name: bills[bills.length - 1]._id.name,
-      category: bills[bills.length - 1]._id.category || 'Uncategorized',
-      quantity: bills[bills.length - 1].totalQuantity
-    } : null;
-    
-    res.json({
-      success: true,
-      bestSellers,
-      worstSeller,
-      totalQuantitySold
-    });
-  } catch (error) {
-    console.error('Error fetching today\'s top products:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch today\'s top products' });
-  }
-});
-
-// Get new customers this month
-router.get('/customers/new-this-month', async (req, res) => {
-  try {
-    const now = new Date();
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-
-    const newCustomers = await Bill.aggregate([
-      { $match: { 'customer.phone': { $ne: null } } },
-      {
-        $group: {
-          _id: '$customer.phone',
-          firstPurchase: { $min: '$createdAt' }
-        }
-      },
-      {
-        $match: {
-          firstPurchase: { $gte: startOfMonth, $lt: endOfMonth }
-        }
-      },
-      { $count: 'count' }
-    ]);
-
-    res.json({ success: true, count: newCustomers[0]?.count || 0 });
-  } catch (error) {
-    console.error('Error fetching new customers:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// Get returning customers percentage this month
-router.get('/customers/returning-percentage', async (req, res) => {
-  try {
-    const now = new Date();
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-
-    const thisMonthCustomers = await Bill.distinct('customer.phone', {
-      createdAt: { $gte: startOfMonth, $lt: endOfMonth },
-      'customer.phone': { $ne: null }
-    });
-
-    if (thisMonthCustomers.length === 0) {
-      return res.json({ success: true, percentage: 0 });
-    }
-
-    const returningCount = await Bill.aggregate([
-      { $match: { 'customer.phone': { $in: thisMonthCustomers } } },
-      {
-        $group: {
-          _id: '$customer.phone',
-          firstPurchase: { $min: '$createdAt' }
-        }
-      },
-      { $match: { firstPurchase: { $lt: startOfMonth } } },
-      { $count: 'count' }
-    ]);
-
-    const percentage = Math.round(((returningCount[0]?.count || 0) / thisMonthCustomers.length) * 100);
-
-    res.json({ success: true, percentage });
-  } catch (error) {
-    console.error('Error fetching returning percentage:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// Get credit customers count all-time
-router.get('/customers/credit-count', async (req, res) => {
-  try {
-    const creditCustomers = await Bill.distinct('customer.phone', {
-      'payment.methods': { $elemMatch: { method: 'credit' } },
-      'customer.phone': { $ne: null }
-    });
-
-    res.json({ success: true, count: creditCustomers.length });
-  } catch (error) {
-    console.error('Error fetching credit count:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// Get top spender this month
-router.get('/customers/top-spender-this-month', async (req, res) => {
-  try {
-    const now = new Date();
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-
-    const topSpender = await Bill.aggregate([
-      {
-        $match: {
-          createdAt: { $gte: startOfMonth, $lt: endOfMonth },
-          'customer.phone': { $ne: null }
-        }
-      },
-      {
-        $group: {
-          _id: {
-            phone: '$customer.phone',
-            name: '$customer.name'
-          },
-          totalSpent: { $sum: '$total' }
-        }
-      },
-      { $sort: { totalSpent: -1 } },
-      { $limit: 1 }
-    ]);
-
-    if (topSpender.length === 0) {
-      return res.json({ success: true, name: '', phone: '' });
-    }
-
-    res.json({
-      success: true,
-      name: topSpender[0]._id.name,
-      phone: topSpender[0]._id.phone
-    });
-  } catch (error) {
-    console.error('Error fetching top spender:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
 // Get all credit bills
-router.get('/credit-bills', async (req, res) => {
+router.get('/credit/credit-bills', auth, async (req, res) => {
   try {
-    const creditBills = await Bill.find({ 
-      'payment.methods': { $elemMatch: { method: 'credit' } }
-    }).sort({ createdAt: -1 });
+    const billsRef = db.collection('bills');
+    const snapshot = await billsRef
+      .where('store', '==', req.user.id)
+      .get();
+    
+    const creditBills = [];
+    snapshot.forEach(doc => {
+      const bill = doc.data();
+      if (bill.payment && bill.payment.methods) {
+        const hasCredit = bill.payment.methods.some(method => method.method === 'credit');
+        if (hasCredit) {
+          creditBills.push({ id: doc.id, ...bill });
+        }
+      }
+    });
+    
+    creditBills.sort((a, b) => {
+      const dateA = a.createdAt && a.createdAt.toDate ? a.createdAt.toDate() : new Date(a.createdAt);
+      const dateB = b.createdAt && b.createdAt.toDate ? b.createdAt.toDate() : new Date(b.createdAt);
+      return dateB - dateA;
+    });
     
     res.json({ success: true, bills: creditBills });
   } catch (error) {
     console.error('Error fetching credit bills:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch credit bills' });
+    res.json({ success: true, bills: [] });
   }
 });
 
 // Get payment methods distribution
-router.get('/payment-methods/distribution', async (req, res) => {
+router.get('/payment-methods/distribution', auth, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     
-    let query = {};
+    let query = db.collection('bills').where('store', '==', req.user.id);
+    
     if (startDate && endDate) {
       const start = new Date(startDate);
       start.setHours(0, 0, 0, 0);
@@ -999,13 +1202,10 @@ router.get('/payment-methods/distribution', async (req, res) => {
       const end = new Date(endDate);
       end.setHours(23, 59, 59, 999);
       
-      query.createdAt = {
-        $gte: start,
-        $lte: end
-      };
+      query = query.where('createdAt', '>=', start).where('createdAt', '<=', end);
     }
-
-    const bills = await Bill.find(query);
+    
+    const snapshot = await query.get();
     
     const distribution = {
       cash: { count: 0, amount: 0 },
@@ -1014,7 +1214,12 @@ router.get('/payment-methods/distribution', async (req, res) => {
       credit: { count: 0, amount: 0 }
     };
     
-    bills.forEach(bill => {
+    let totalAmount = 0;
+    
+    snapshot.forEach(doc => {
+      const bill = doc.data();
+      totalAmount += bill.total || 0;
+      
       if (bill.payment && bill.payment.methods) {
         if (bill.payment.type === 'single' && bill.payment.methods[0]) {
           const method = bill.payment.methods[0].method;
@@ -1036,12 +1241,17 @@ router.get('/payment-methods/distribution', async (req, res) => {
     res.json({
       success: true,
       distribution,
-      totalBills: bills.length,
-      totalAmount: bills.reduce((sum, bill) => sum + (bill.total || 0), 0)
+      totalBills: snapshot.size,
+      totalAmount
     });
   } catch (error) {
     console.error('Error fetching payment methods distribution:', error);
-    res.status(500).json({ success: false, error: 'Failed to fetch payment methods distribution' });
+    res.json({ 
+      success: true, 
+      distribution: { cash: { count: 0, amount: 0 }, card: { count: 0, amount: 0 }, ewallet: { count: 0, amount: 0 }, credit: { count: 0, amount: 0 } },
+      totalBills: 0,
+      totalAmount: 0
+    });
   }
 });
 

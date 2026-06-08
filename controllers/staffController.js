@@ -1,35 +1,76 @@
-// backend/controllers/staffController.js
-const Staff = require('../models/Staff');
-const Attendance = require('../models/Attendance');
-const Payroll = require('../models/Payroll');
-const Leave = require('../models/Leave');
+const { db } = require('../firebase');
+const { FieldValue } = require('firebase-admin/firestore');
+
+// Helper function to find staff by ID and store
+const findStaffById = async (id, storeId) => {
+  if (!id) return null;
+  const staffRef = db.collection('staff').doc(id);
+  const staffDoc = await staffRef.get();
+  
+  if (!staffDoc.exists) return null;
+  const staff = { id: staffDoc.id, ...staffDoc.data() };
+  if (staff.store !== storeId) return null;
+  return staff;
+};
+
+// Helper function to check if staff has related records
+const hasRelatedRecords = async (staffId, storeId) => {
+  const attendanceSnapshot = await db.collection('attendance')
+    .where('staffId', '==', staffId)
+    .where('store', '==', storeId)
+    .limit(1)
+    .get();
+  
+  const payrollSnapshot = await db.collection('payrolls')
+    .where('staffId', '==', staffId)
+    .where('store', '==', storeId)
+    .limit(1)
+    .get();
+  
+  const leaveSnapshot = await db.collection('leaves')
+    .where('staffId', '==', staffId)
+    .where('store', '==', storeId)
+    .limit(1)
+    .get();
+  
+  return !attendanceSnapshot.empty || !payrollSnapshot.empty || !leaveSnapshot.empty;
+};
 
 // Get all staff with filtering and pagination
 exports.getAllStaff = async (req, res) => {
   try {
     const { page = 1, limit = 10, search, position, status } = req.query;
     
-    // Filter by the current user's ID
-    const query = { user: req.user._id };
+    let query = db.collection('staff')
+      .where('store', '==', req.user.id);
     
-    if (search) {
-      query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } },
-        { phone: { $regex: search, $options: 'i' } }
-      ];
+    const snapshot = await query
+      .orderBy('createdAt', 'desc')
+      .limit(parseInt(limit))
+      .get();
+    
+    const staff = [];
+    for (const doc of snapshot.docs) {
+      let staffMember = { id: doc.id, ...doc.data() };
+      
+      // Apply filters in memory (Firestore doesn't support text search well)
+      if (search) {
+        const searchLower = search.toLowerCase();
+        const matches = staffMember.name?.toLowerCase().includes(searchLower) ||
+                       staffMember.email?.toLowerCase().includes(searchLower) ||
+                       staffMember.phone?.includes(search);
+        if (!matches) continue;
+      }
+      if (position && staffMember.position !== position) continue;
+      if (status && staffMember.status !== status) continue;
+      
+      staff.push(staffMember);
     }
     
-    if (position) query.position = position;
-    if (status) query.status = status;
-    
-    const staff = await Staff.find(query)
-      .populate('user', 'storeName address')
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .sort({ createdAt: -1 });
-    
-    const total = await Staff.countDocuments(query);
+    const totalSnapshot = await db.collection('staff')
+      .where('store', '==', req.user.id)
+      .get();
+    const total = totalSnapshot.size;
     
     res.status(200).json({
       success: true,
@@ -43,6 +84,7 @@ exports.getAllStaff = async (req, res) => {
       }
     });
   } catch (err) {
+    console.error('Error fetching staff:', err);
     res.status(500).json({
       success: false,
       message: 'Error fetching staff',
@@ -54,8 +96,7 @@ exports.getAllStaff = async (req, res) => {
 // Get single staff member
 exports.getStaff = async (req, res) => {
   try {
-    const staff = await Staff.findById(req.params.id)
-      .populate('user', 'storeName address');
+    const staff = await findStaffById(req.params.id, req.user.id);
     
     if (!staff) {
       return res.status(404).json({
@@ -64,19 +105,12 @@ exports.getStaff = async (req, res) => {
       });
     }
     
-    // Check if staff belongs to the current user
-    if (staff.user._id.toString() !== req.user._id.toString()) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied. Staff member does not belong to your account.'
-      });
-    }
-    
     res.status(200).json({
       success: true,
       data: { staff }
     });
   } catch (err) {
+    console.error('Error fetching staff member:', err);
     res.status(500).json({
       success: false,
       message: 'Error fetching staff member',
@@ -90,35 +124,24 @@ exports.createStaff = async (req, res) => {
   try {
     const staffData = {
       ...req.body,
-      user: req.user._id,
-      createdBy: req.user._id
+      store: req.user.id,
+      createdBy: req.user.id,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      status: req.body.status || 'active'
     };
     
-    const staff = await Staff.create(staffData);
+    const staffRef = db.collection('staff');
+    const docRef = await staffRef.add(staffData);
+    const newStaff = { id: docRef.id, ...staffData };
     
     res.status(201).json({
       success: true,
       message: 'Staff member created successfully',
-      data: { staff }
+      data: { staff: newStaff }
     });
   } catch (err) {
-    if (err.code === 11000) {
-      return res.status(400).json({
-        success: false,
-        message: 'Email or phone number already exists',
-        error: err.message
-      });
-    }
-    
-    if (err.name === 'ValidationError') {
-      const errors = Object.values(err.errors).map(val => val.message);
-      return res.status(400).json({
-        success: false,
-        message: 'Validation Error',
-        errors: errors
-      });
-    }
-    
+    console.error('Error creating staff member:', err);
     res.status(500).json({
       success: false,
       message: 'Error creating staff member',
@@ -130,7 +153,7 @@ exports.createStaff = async (req, res) => {
 // Update staff member
 exports.updateStaff = async (req, res) => {
   try {
-    let staff = await Staff.findById(req.params.id);
+    const staff = await findStaffById(req.params.id, req.user.id);
     
     if (!staff) {
       return res.status(404).json({
@@ -139,42 +162,23 @@ exports.updateStaff = async (req, res) => {
       });
     }
     
-    // Check if staff belongs to the current user
-    if (staff.user.toString() !== req.user._id.toString()) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied. Staff member does not belong to your account.'
-      });
-    }
+    const staffRef = db.collection('staff').doc(req.params.id);
+    const updateData = {
+      ...req.body,
+      updatedAt: new Date()
+    };
     
-    staff = await Staff.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true, runValidators: true }
-    );
+    await staffRef.update(updateData);
+    const updatedDoc = await staffRef.get();
+    const updatedStaff = { id: updatedDoc.id, ...updatedDoc.data() };
     
     res.status(200).json({
       success: true,
       message: 'Staff member updated successfully',
-      data: { staff }
+      data: { staff: updatedStaff }
     });
   } catch (err) {
-    if (err.code === 11000) {
-      return res.status(400).json({
-        success: false,
-        message: 'Email or phone number already exists'
-      });
-    }
-    
-    if (err.name === 'ValidationError') {
-      const errors = Object.values(err.errors).map(val => val.message);
-      return res.status(400).json({
-        success: false,
-        message: 'Validation Error',
-        errors: errors
-      });
-    }
-    
+    console.error('Error updating staff member:', err);
     res.status(500).json({
       success: false,
       message: 'Error updating staff member',
@@ -186,7 +190,7 @@ exports.updateStaff = async (req, res) => {
 // Delete staff member
 exports.deleteStaff = async (req, res) => {
   try {
-    const staff = await Staff.findById(req.params.id);
+    const staff = await findStaffById(req.params.id, req.user.id);
     
     if (!staff) {
       return res.status(404).json({
@@ -195,33 +199,24 @@ exports.deleteStaff = async (req, res) => {
       });
     }
     
-    // Check if staff belongs to the current user
-    if (staff.user.toString() !== req.user._id.toString()) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied. Staff member does not belong to your account.'
-      });
-    }
-    
     // Check if staff has related records
-    const hasAttendance = await Attendance.findOne({ staff: req.params.id });
-    const hasPayroll = await Payroll.findOne({ staff: req.params.id });
-    const hasLeave = await Leave.findOne({ staff: req.params.id });
+    const hasRecords = await hasRelatedRecords(req.params.id, req.user.id);
     
-    if (hasAttendance || hasPayroll || hasLeave) {
+    if (hasRecords) {
       return res.status(400).json({
         success: false,
         message: 'Cannot delete staff member with existing records. Please deactivate instead.'
       });
     }
     
-    await Staff.findByIdAndDelete(req.params.id);
+    await db.collection('staff').doc(req.params.id).delete();
     
     res.status(200).json({
       success: true,
       message: 'Staff member deleted successfully'
     });
   } catch (err) {
+    console.error('Error deleting staff member:', err);
     res.status(500).json({
       success: false,
       message: 'Error deleting staff member',
@@ -231,21 +226,46 @@ exports.deleteStaff = async (req, res) => {
 };
 
 // Get staff statistics
+// Replace the getStaffStats function with this version
 exports.getStaffStats = async (req, res) => {
   try {
-    const totalStaff = await Staff.countDocuments({ user: req.user._id });
-    const activeStaff = await Staff.countDocuments({ 
-      user: req.user._id, 
-      status: 'active' 
-    });
+    let totalStaff = 0;
+    let activeStaff = 0;
+    const positionMap = new Map();
     
-    const positionStats = await Staff.aggregate([
-      { $match: { user: req.user._id, status: 'active' } },
-      { $group: { _id: '$position', count: { $sum: 1 } } },
-      { $sort: { count: -1 } }
-    ]);
+    try {
+      const snapshot = await db.collection('staff')
+        .where('store', '==', req.user.id)
+        .get();
+      
+      totalStaff = snapshot.size;
+      
+      for (const doc of snapshot.docs) {
+        const staff = doc.data();
+        if (staff.status === 'active') activeStaff++;
+        if (staff.status === 'active' && staff.position) {
+          positionMap.set(staff.position, (positionMap.get(staff.position) || 0) + 1);
+        }
+      }
+    } catch (staffErr) {
+      console.error('Error fetching staff:', staffErr);
+    }
     
-    const pendingPayroll = await Payroll.countDocuments({ user: req.user._id, status: 'pending' });
+    const positionStats = Array.from(positionMap.entries()).map(([position, count]) => ({
+      _id: position,
+      count
+    })).sort((a, b) => b.count - a.count);
+    
+    let pendingPayroll = 0;
+    try {
+      const payrollSnapshot = await db.collection('payrolls')
+        .where('store', '==', req.user.id)
+        .where('status', '==', 'pending')
+        .get();
+      pendingPayroll = payrollSnapshot.size;
+    } catch (payrollErr) {
+      console.error('Error fetching payroll:', payrollErr);
+    }
     
     res.status(200).json({
       success: true,
@@ -258,11 +278,16 @@ exports.getStaffStats = async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching staff statistics',
-      error: err.message
+    console.error('Error fetching staff statistics:', err);
+    res.status(200).json({
+      success: true,
+      data: {
+        totalStaff: 0,
+        activeStaff: 0,
+        inactiveStaff: 0,
+        positionStats: [],
+        pendingPayroll: 0
+      }
     });
   }
 };
-
