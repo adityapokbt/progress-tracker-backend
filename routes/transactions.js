@@ -1,195 +1,87 @@
 // transaction routes (with added /pending-payments route)
 const express = require('express');
-const { mongooseCompat } = require('../utils/firestoreModel');
-const mongoose = mongooseCompat;
 const auth = require('../middleware/auth');
-const SupplierTransaction = require('../models/SupplierTransaction');
-const Supplier = require('../models/Supplier');
-const PurchaseOrder = require('../models/PurchaseOrder');
+const { db } = require('../firebase');
+const { FieldValue } = require('firebase-admin/firestore');
 const router = express.Router();
 
-// IMPORTANT: Specific routes must come BEFORE parameterized routes
-// Get transaction summary for dashboard - MUST COME FIRST
-router.get('/summary', auth, async (req, res) => {
-  try {
-    console.log('Calculating transaction summary...');
-    
-    // SIMPLE calculation - get the latest balance for each supplier
-    const transactions = await SupplierTransaction.find({ 
-      store: req.user._id 
-    })
-    .populate('supplier')
-    .sort({ paymentDate: -1, createdAt: -1 })
-    .limit(1000);
-    
-    console.log(`Found ${transactions.length} transactions`);
-    
-    // Group by supplier and get latest balance
-    const supplierBalances = {};
-    
-    transactions.forEach(transaction => {
-      if (!transaction.supplier || !transaction.supplier._id) return;
-      
-      const supplierId = transaction.supplier._id.toString();
-      
-      // Only take the first (latest) transaction for each supplier
-      if (!supplierBalances[supplierId]) {
-        supplierBalances[supplierId] = transaction.balanceAfter || 0;
-      }
-    });
-    
-    // Calculate totals
-    let totalPayable = 0;
-    let totalReceivable = 0;
-    
-    Object.values(supplierBalances).forEach(balance => {
-      if (balance > 0) {
-        totalPayable += balance;
-      } else if (balance < 0) {
-        totalReceivable += Math.abs(balance);
-      }
-    });
-    
-    console.log('Summary calculated:', { totalPayable, totalReceivable });
-    
-    res.status(200).json({
-      status: 'success',
-      data: {
-        totalPayable,
-        totalReceivable
-      }
-    });
-    
-  } catch (err) {
-    console.error('Error in summary endpoint:', err);
-    
-    // Return zeros if anything fails
-    res.status(200).json({
-      status: 'success',
-      data: {
-        totalPayable: 0,
-        totalReceivable: 0
-      }
-    });
-  }
-});
-// Add this route after your existing routes in supplier transaction routes
-router.get('/pending-payments', auth, async (req, res) => {
-  try {
-   const pendingTransactions = await SupplierTransaction.find({
-  store: req.user._id,
-  $or: [
-    { balanceAfter: { $gt: 0 } },  // Positive balances (advances/credits)
-    { balanceAfter: { $lt: 0 } }   // Negative balances (refunds)
-  ]
-})
-.populate('supplier', 'name companyName')
-.sort({ balanceAfter: -1 });  // This will still put largest positive first
+// Helper function to find supplier by ID and store
+const findSupplierById = async (id, storeId) => {
+  const supplierRef = db.collection('suppliers').doc(id);
+  const supplierDoc = await supplierRef.get();
+  
+  if (!supplierDoc.exists) return null;
+  const supplier = { id: supplierDoc.id, ...supplierDoc.data() };
+  if (supplier.store !== storeId) return null;
+  return supplier;
+};
 
-// For total pending, you might want the absolute sum
-const totalPending = pendingTransactions.reduce((sum, transaction) => {
-  return sum + Math.abs(transaction.balanceAfter || 0);
-}, 0);
-    
-    res.status(200).json({
-      status: 'success',
-      data: {
-        totalPending,
-        transactions: pendingTransactions,
-        count: pendingTransactions.length
-      }
-    });
-  } catch (err) {
-    console.error('Error fetching pending payments:', err);
-    res.status(500).json({
-      status: 'error',
-      message: 'Error fetching pending payments'
-    });
-  }
-});
+// Helper function to get all transactions for a supplier
+const getSupplierTransactions = async (supplierId, storeId) => {
+  const transactionsRef = db.collection('supplierTransactions');
+  const snapshot = await transactionsRef
+    .where('supplierId', '==', supplierId)
+    .where('store', '==', storeId)
+    .orderBy('paymentDate', 'asc')
+    .orderBy('createdAt', 'asc')
+    .get();
+  
+  const transactions = [];
+  snapshot.forEach(doc => {
+    transactions.push({ id: doc.id, ...doc.data() });
+  });
+  
+  return transactions;
+};
 
-// Get all transactions for the authenticated user's store
-router.get('/', auth, async (req, res) => {
-  try {
-    const { supplier, type, page = 1, limit = 10 } = req.query;
-    let filter = { store: req.user._id };
-    
-    if (supplier) filter.supplier = supplier;
-    if (type) filter.type = type;
-    
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
-    const skip = (pageNum - 1) * limitNum;
-    
-    const transactions = await SupplierTransaction.find(filter)
-      .populate('supplier', 'name companyName')
-      .populate('purchaseOrder', 'poNumber')
-      .sort({ paymentDate: -1 })
-      .skip(skip)
-      .limit(limitNum);
-    
-    const total = await SupplierTransaction.countDocuments(filter);
-    
-    res.status(200).json({
-      status: 'success',
-      results: transactions.length,
-      data: { 
-        transactions,
-        pagination: {
-          page: pageNum,
-          limit: limitNum,
-          total,
-          pages: Math.ceil(total / limitNum)
-        }
-      }
-    });
-  } catch (err) {
-    console.error('Error fetching transactions:', err);
-    res.status(500).json({
-      status: 'error',
-      message: 'Error fetching transactions'
-    });
-  }
-});
-
-// Get a specific transaction - THIS MUST COME AFTER /summary
-router.get('/:id', auth, async (req, res) => {
-  try {
-    // Check if the ID is a valid ObjectId to prevent errors
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({
-        status: 'fail',
-        message: 'Invalid transaction ID format'
-      });
+// Helper function to recalculate all balances for a supplier
+const recalculateSupplierBalances = async (supplierId, storeId, excludeTransactionId = null) => {
+  const transactions = await getSupplierTransactions(supplierId, storeId);
+  
+  let runningBalance = 0;
+  const batch = db.batch();
+  const updatedTransactions = [];
+  
+  for (const transaction of transactions) {
+    // Skip the excluded transaction if it's being deleted/updated
+    if (excludeTransactionId && transaction.id === excludeTransactionId) {
+      continue;
     }
     
-    const transaction = await SupplierTransaction.findOne({
-      _id: req.params.id,
-      store: req.user._id
-    })
-    .populate('supplier', 'name companyName')
-    .populate('purchaseOrder', 'poNumber');
+    const previousBalance = runningBalance;
+    const amount = transaction.amount || 0;
     
-    if (!transaction) {
-      return res.status(404).json({
-        status: 'fail',
-        message: 'Transaction not found'
-      });
+    if (transaction.type === 'Payment' || transaction.type === 'Refund') {
+      runningBalance -= amount;
+    } else {
+      runningBalance += amount;
     }
     
-    res.status(200).json({
-      status: 'success',
-      data: { transaction }
+    // Update transaction with new balances
+    const transactionRef = db.collection('supplierTransactions').doc(transaction.id);
+    batch.update(transactionRef, {
+      balanceBefore: previousBalance,
+      balanceAfter: runningBalance,
+      updatedAt: new Date()
     });
-  } catch (err) {
-    console.error('Error fetching transaction:', err);
-    res.status(500).json({
-      status: 'error',
-      message: 'Error fetching transaction'
+    
+    updatedTransactions.push({
+      id: transaction.id,
+      balanceAfter: runningBalance
     });
   }
-});
-
+  
+  await batch.commit();
+  
+  // Update supplier's outstanding balance
+  const supplierRef = db.collection('suppliers').doc(supplierId);
+  await supplierRef.update({
+    outstandingBalance: runningBalance,
+    updatedAt: new Date()
+  });
+  
+  return { finalBalance: runningBalance, updatedCount: updatedTransactions.length };
+};
 
 const validateTransaction = (transactionData) => {
   const errors = {};
@@ -217,10 +109,202 @@ const validateTransaction = (transactionData) => {
   
   return errors;
 };
-// Create a new transaction - FIXED PAYMENT MODE HANDLING
+
+// IMPORTANT: Specific routes must come BEFORE parameterized routes
+// Get transaction summary for dashboard - MUST COME FIRST
+router.get('/summary', auth, async (req, res) => {
+  try {
+    console.log('Calculating transaction summary...');
+    
+    // Get all suppliers for this store
+    const suppliersRef = db.collection('suppliers');
+    const suppliersSnapshot = await suppliersRef.where('store', '==', req.user.id).get();
+    
+    let totalPayable = 0;
+    let totalReceivable = 0;
+    
+    // For each supplier, get latest transaction balance
+    for (const supplierDoc of suppliersSnapshot.docs) {
+      const supplierId = supplierDoc.id;
+      const transactions = await getSupplierTransactions(supplierId, req.user.id);
+      
+      let latestBalance = 0;
+      if (transactions.length > 0) {
+        latestBalance = transactions[transactions.length - 1].balanceAfter || 0;
+      } else {
+        // If no transactions, use supplier's outstanding balance
+        const supplier = supplierDoc.data();
+        latestBalance = supplier.outstandingBalance || 0;
+      }
+      
+      if (latestBalance > 0) {
+        totalPayable += latestBalance;
+      } else if (latestBalance < 0) {
+        totalReceivable += Math.abs(latestBalance);
+      }
+    }
+    
+    console.log('Summary calculated:', { totalPayable, totalReceivable });
+    
+    res.status(200).json({
+      status: 'success',
+      data: {
+        totalPayable,
+        totalReceivable
+      }
+    });
+    
+  } catch (err) {
+    console.error('Error in summary endpoint:', err);
+    
+    // Return zeros if anything fails
+    res.status(200).json({
+      status: 'success',
+      data: {
+        totalPayable: 0,
+        totalReceivable: 0
+      }
+    });
+  }
+});
+
+// Get pending payments
+router.get('/pending-payments', auth, async (req, res) => {
+  try {
+    // Get all suppliers for this store
+    const suppliersRef = db.collection('suppliers');
+    const suppliersSnapshot = await suppliersRef.where('store', '==', req.user.id).get();
+    
+    const pendingTransactions = [];
+    let totalPending = 0;
+    
+    for (const supplierDoc of suppliersSnapshot.docs) {
+      const supplier = { id: supplierDoc.id, ...supplierDoc.data() };
+      const transactions = await getSupplierTransactions(supplier.id, req.user.id);
+      
+      let latestBalance = 0;
+      if (transactions.length > 0) {
+        latestBalance = transactions[transactions.length - 1].balanceAfter || 0;
+      } else {
+        latestBalance = supplier.outstandingBalance || 0;
+      }
+      
+      if (latestBalance !== 0) {
+        pendingTransactions.push({
+          id: supplier.id,
+          supplier,
+          balanceAfter: latestBalance,
+          type: latestBalance > 0 ? 'Payable' : 'Receivable',
+          paymentDate: new Date()
+        });
+        totalPending += Math.abs(latestBalance);
+      }
+    }
+    
+    // Sort by absolute balance (largest first)
+    pendingTransactions.sort((a, b) => Math.abs(b.balanceAfter) - Math.abs(a.balanceAfter));
+    
+    res.status(200).json({
+      status: 'success',
+      data: {
+        totalPending,
+        transactions: pendingTransactions,
+        count: pendingTransactions.length
+      }
+    });
+  } catch (err) {
+    console.error('Error fetching pending payments:', err);
+    res.status(500).json({
+      status: 'error',
+      message: 'Error fetching pending payments'
+    });
+  }
+});
+
+// Get all transactions for the authenticated user's store
+router.get('/', auth, async (req, res) => {
+  try {
+    const { supplier, type, page = 1, limit = 10 } = req.query;
+    
+    let query = db.collection('supplierTransactions')
+      .where('store', '==', req.user.id);
+    
+    if (supplier) query = query.where('supplierId', '==', supplier);
+    if (type) query = query.where('type', '==', type);
+    
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    
+    const snapshot = await query
+      .orderBy('paymentDate', 'desc')
+      .limit(limitNum)
+      .get();
+    
+    const transactions = [];
+    for (const doc of snapshot.docs) {
+      const transaction = { id: doc.id, ...doc.data() };
+      
+      // Fetch supplier details
+      if (transaction.supplierId) {
+        const supplierData = await findSupplierById(transaction.supplierId, req.user.id);
+        if (supplierData) {
+          transaction.supplier = { id: supplierData.id, name: supplierData.name, companyName: supplierData.companyName };
+        }
+      }
+      
+      // Fetch purchase order details if exists
+      if (transaction.purchaseOrderId) {
+        const poRef = db.collection('purchaseOrders').doc(transaction.purchaseOrderId);
+        const poDoc = await poRef.get();
+        if (poDoc.exists) {
+          transaction.purchaseOrder = { id: poDoc.id, poNumber: poDoc.data().poNumber };
+        }
+      }
+      
+      transactions.push(transaction);
+    }
+    
+    // Get total count
+    const totalSnapshot = await db.collection('supplierTransactions')
+      .where('store', '==', req.user.id)
+      .get();
+    const total = totalSnapshot.size;
+    
+    res.status(200).json({
+      status: 'success',
+      results: transactions.length,
+      data: { 
+        transactions,
+        pagination: {
+          page: pageNum,
+          limit: limitNum,
+          total,
+          pages: Math.ceil(total / limitNum)
+        }
+      }
+    });
+  } catch (err) {
+    console.error('Error fetching transactions:', err);
+    res.status(500).json({
+      status: 'error',
+      message: 'Error fetching transactions'
+    });
+  }
+});
+
+// Create a new transaction
 router.post('/', auth, async (req, res) => {
   try {
-     const { supplier, type, amount, paymentDate, paymentMode, referenceNumber } = req.body;
+    const { supplier: supplierId, type, amount, paymentDate, paymentMode, referenceNumber, notes, purchaseOrderId } = req.body;
+    
+    // Validate supplier exists and belongs to store
+    const supplier = await findSupplierById(supplierId, req.user.id);
+    if (!supplier) {
+      return res.status(404).json({
+        status: 'fail',
+        message: 'Supplier not found'
+      });
+    }
     
     // Validate transaction
     const validationErrors = validateTransaction(req.body);
@@ -253,69 +337,78 @@ router.post('/', auth, async (req, res) => {
       });
     }
     
+    // Get previous balance
+    const previousTransactions = await getSupplierTransactions(supplierId, req.user.id);
+    let previousBalance = supplier.outstandingBalance || 0;
+    
+    if (previousTransactions.length > 0) {
+      previousBalance = previousTransactions[previousTransactions.length - 1].balanceAfter || 0;
+    }
+    
+    const transactionAmount = parseFloat(amount);
+    let newBalance;
+    
+    if (type === 'Payment' || type === 'Refund') {
+      newBalance = previousBalance - transactionAmount;
+    } else {
+      newBalance = previousBalance + transactionAmount;
+    }
+    
     // Prepare transaction data
     const transactionData = {
-      ...req.body,
-      store: req.user._id,
-      amount: parseFloat(amount) // Ensure amount is a number
+      supplierId,
+      supplierName: supplier.name,
+      store: req.user.id,
+      type,
+      amount: transactionAmount,
+      paymentDate: new Date(paymentDate),
+      balanceBefore: previousBalance,
+      balanceAfter: newBalance,
+      notes: notes || null,
+      createdAt: new Date(),
+      updatedAt: new Date()
     };
     
-    // For Credit transactions, don't include paymentMode at all
-    if (type === 'Credit') {
-      delete transactionData.paymentMode;
-    } else {
-      // Validate payment mode for non-Credit transactions
+    // Add payment mode for non-Credit transactions
+    if (type !== 'Credit') {
       if (!paymentMode || !['Cash', 'Bank Transfer', 'Esewa', 'Khalti', 'ConnectIPS', 'Cheque'].includes(paymentMode)) {
         return res.status(400).json({
           status: 'fail',
           message: 'Valid payment mode is required for non-Credit transactions'
         });
       }
+      transactionData.paymentMode = paymentMode;
+      if (referenceNumber) transactionData.referenceNumber = referenceNumber;
     }
     
-    // Get the previous balance
-    const lastTransaction = await SupplierTransaction.findOne({
-      supplier: req.body.supplier,
-      store: req.user._id
-    }).sort({ paymentDate: -1 });
-    
-    const previousBalance = lastTransaction ? lastTransaction.balanceAfter : 0;
-    transactionData.balanceBefore = previousBalance;
-    
-    // Calculate new balance based on transaction type
-    let newBalance;
-    if (type === 'Payment' || type === 'Refund') {
-      newBalance = previousBalance - parseFloat(amount);
-    } else {
-      newBalance = previousBalance + parseFloat(amount);
+    // Add purchase order reference if provided
+    if (purchaseOrderId) {
+      const poRef = db.collection('purchaseOrders').doc(purchaseOrderId);
+      const poDoc = await poRef.get();
+      if (poDoc.exists) {
+        transactionData.purchaseOrderId = purchaseOrderId;
+        transactionData.purchaseOrderNumber = poDoc.data().poNumber;
+      }
     }
     
-    transactionData.balanceAfter = newBalance;
+    const transactionsRef = db.collection('supplierTransactions');
+    const docRef = await transactionsRef.add(transactionData);
     
-    const transaction = await SupplierTransaction.create(transactionData);
+    // Update supplier's outstanding balance
+    const supplierRef = db.collection('suppliers').doc(supplierId);
+    await supplierRef.update({
+      outstandingBalance: newBalance,
+      updatedAt: new Date()
+    });
     
-    // Populate supplier and purchase order details
-    await transaction.populate('supplier', 'name companyName');
-    if (transaction.purchaseOrder) {
-      await transaction.populate('purchaseOrder', 'poNumber');
-    }
+    const newTransaction = { id: docRef.id, ...transactionData };
     
     res.status(201).json({
       status: 'success',
-      data: { transaction }
+      data: { transaction: newTransaction }
     });
   } catch (err) {
     console.error('Error creating transaction:', err);
-    
-    if (err.name === 'ValidationError') {
-      const errors = Object.values(err.errors).map(el => el.message);
-      return res.status(400).json({
-        status: 'fail',
-        message: 'Validation error',
-        errors
-      });
-    }
-    
     res.status(500).json({
       status: 'error',
       message: 'Error creating transaction'
@@ -323,35 +416,108 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-// Update a transaction - FIXED BALANCE RECALCULATION
-router.put('/:id', auth, async (req, res) => {
+// Get a specific transaction
+router.get('/:id', auth, async (req, res) => {
   try {
-    // Validate ObjectId first
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({
-        status: 'fail',
-        message: 'Invalid transaction ID format'
-      });
-    }
+    const transactionRef = db.collection('supplierTransactions').doc(req.params.id);
+    const transactionDoc = await transactionRef.get();
     
-    // Find the existing transaction
-    const existingTransaction = await SupplierTransaction.findOne({
-      _id: req.params.id,
-      store: req.user._id
-    });
-    
-    if (!existingTransaction) {
+    if (!transactionDoc.exists) {
       return res.status(404).json({
         status: 'fail',
         message: 'Transaction not found'
       });
     }
     
-    // Prepare updates
-    const updates = { ...req.body };
+    const transaction = { id: transactionDoc.id, ...transactionDoc.data() };
     
-    // Convert amount to number if provided
-    if (updates.amount !== undefined) {
+    // Verify store ownership
+    if (transaction.store !== req.user.id) {
+      return res.status(403).json({
+        status: 'fail',
+        message: 'Access denied'
+      });
+    }
+    
+    // Fetch supplier details
+    if (transaction.supplierId) {
+      const supplier = await findSupplierById(transaction.supplierId, req.user.id);
+      if (supplier) {
+        transaction.supplier = { id: supplier.id, name: supplier.name, companyName: supplier.companyName };
+      }
+    }
+    
+    // Fetch purchase order details if exists
+    if (transaction.purchaseOrderId) {
+      const poRef = db.collection('purchaseOrders').doc(transaction.purchaseOrderId);
+      const poDoc = await poRef.get();
+      if (poDoc.exists) {
+        transaction.purchaseOrder = { id: poDoc.id, poNumber: poDoc.data().poNumber };
+      }
+    }
+    
+    res.status(200).json({
+      status: 'success',
+      data: { transaction }
+    });
+  } catch (err) {
+    console.error('Error fetching transaction:', err);
+    res.status(500).json({
+      status: 'error',
+      message: 'Error fetching transaction'
+    });
+  }
+});
+
+// Update a transaction
+router.put('/:id', auth, async (req, res) => {
+  try {
+    const transactionRef = db.collection('supplierTransactions').doc(req.params.id);
+    const transactionDoc = await transactionRef.get();
+    
+    if (!transactionDoc.exists) {
+      return res.status(404).json({
+        status: 'fail',
+        message: 'Transaction not found'
+      });
+    }
+    
+    const existingTransaction = { id: transactionDoc.id, ...transactionDoc.data() };
+    
+    // Verify store ownership
+    if (existingTransaction.store !== req.user.id) {
+      return res.status(403).json({
+        status: 'fail',
+        message: 'Access denied'
+      });
+    }
+    
+    // Check if there are subsequent transactions (by date)
+    const laterTransactions = await db.collection('supplierTransactions')
+      .where('supplierId', '==', existingTransaction.supplierId)
+      .where('store', '==', req.user.id)
+      .where('paymentDate', '>', existingTransaction.paymentDate)
+      .limit(1)
+      .get();
+    
+    if (!laterTransactions.empty) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Cannot update transaction with subsequent transactions. Please delete later transactions first.'
+      });
+    }
+    
+    const updates = { ...req.body, updatedAt: new Date() };
+    
+    // Validate updates
+    if (updates.type && !['Payment', 'Credit', 'Refund', 'Advance'].includes(updates.type)) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Valid transaction type is required'
+      });
+    }
+    
+    if (updates.amount) {
       updates.amount = parseFloat(updates.amount);
       if (isNaN(updates.amount) || updates.amount <= 0) {
         return res.status(400).json({
@@ -361,124 +527,30 @@ router.put('/:id', auth, async (req, res) => {
       }
     }
     
-    // Convert paymentDate to Date if provided
-    if (updates.paymentDate !== undefined) {
+    if (updates.paymentDate) {
       updates.paymentDate = new Date(updates.paymentDate);
-      if (isNaN(updates.paymentDate.getTime())) {
-        return res.status(400).json({
-          status: 'fail',
-          message: 'Valid payment date is required'
-        });
-      }
-    }
-    
-    // Validate transaction type if provided
-    if (updates.type !== undefined && !['Payment', 'Credit', 'Refund', 'Advance'].includes(updates.type)) {
-      return res.status(400).json({
-        status: 'fail',
-        message: 'Valid transaction type is required'
-      });
     }
     
     // For Credit transactions, remove paymentMode
     const finalType = updates.type || existingTransaction.type;
     if (finalType === 'Credit') {
       delete updates.paymentMode;
-    } else if (updates.paymentMode !== undefined) {
-      // Validate payment mode for non-Credit transactions
-      if (!['Cash', 'Bank Transfer', 'Esewa', 'Khalti', 'ConnectIPS', 'Cheque'].includes(updates.paymentMode)) {
-        return res.status(400).json({
-          status: 'fail',
-          message: 'Valid payment mode is required for non-Credit transactions'
-        });
-      }
     }
     
-    // If amount, type, or paymentDate is changed, we need to recalculate ALL balances for this supplier
-    const needsRecalculation = updates.amount !== undefined || updates.type !== undefined || updates.paymentDate !== undefined;
+    // Update the transaction
+    await transactionRef.update(updates);
     
-    if (needsRecalculation) {
-      console.log('Recalculating balances due to financial field changes...');
-      
-      // Get ALL transactions for this supplier, sorted by date and creation time
-      const allTransactions = await SupplierTransaction.find({
-        supplier: existingTransaction.supplier,
-        store: req.user._id
-      }).sort({ paymentDate: 1, createdAt: 1 });
-      
-      let runningBalance = 0;
-      const transactionsToUpdate = [];
-      
-      // First pass: calculate new balances and collect transactions that need updating
-      for (const transaction of allTransactions) {
-        let transactionAmount = transaction.amount;
-        let transactionType = transaction.type;
-        
-        // If this is the transaction being updated, use new values
-        if (transaction._id.toString() === req.params.id) {
-          transactionAmount = updates.amount !== undefined ? updates.amount : transaction.amount;
-          transactionType = updates.type !== undefined ? updates.type : transaction.type;
-        }
-        
-        // Store the previous balance before updating
-        const previousBalance = runningBalance;
-        
-        // Calculate new balance
-        if (transactionType === 'Payment' || transactionType === 'Refund') {
-          runningBalance -= transactionAmount;
-        } else {
-          runningBalance += transactionAmount;
-        }
-        
-        // Store transaction update data
-        transactionsToUpdate.push({
-          _id: transaction._id,
-          balanceBefore: previousBalance,
-          balanceAfter: runningBalance,
-          isCurrent: transaction._id.toString() === req.params.id
-        });
-      }
-      
-      // Second pass: update all transactions with new balances
-      for (const transactionUpdate of transactionsToUpdate) {
-        if (transactionUpdate.isCurrent) {
-          // For the current transaction, add balance updates
-          updates.balanceBefore = transactionUpdate.balanceBefore;
-          updates.balanceAfter = transactionUpdate.balanceAfter;
-        } else {
-          // For other transactions, only update balances
-          await SupplierTransaction.findByIdAndUpdate(
-            transactionUpdate._id,
-            {
-              balanceBefore: transactionUpdate.balanceBefore,
-              balanceAfter: transactionUpdate.balanceAfter
-            }
-          );
-        }
-      }
+    // Recalculate all balances for this supplier
+    await recalculateSupplierBalances(existingTransaction.supplierId, req.user.id);
+    
+    const updatedDoc = await transactionRef.get();
+    const updatedTransaction = { id: updatedDoc.id, ...updatedDoc.data() };
+    
+    // Fetch supplier details
+    const supplier = await findSupplierById(updatedTransaction.supplierId, req.user.id);
+    if (supplier) {
+      updatedTransaction.supplier = { id: supplier.id, name: supplier.name, companyName: supplier.companyName };
     }
-    
-    // Remove fields that shouldn't be updated directly
-    delete updates.store;
-    delete updates.supplier;
-    delete updates.purchaseOrder;
-    delete updates.createdAt;
-    
-    const updatedTransaction = await SupplierTransaction.findByIdAndUpdate(
-      req.params.id,
-      updates,
-      { new: true, runValidators: true }
-    )
-    .populate('supplier', 'name companyName')
-    .populate('purchaseOrder', 'poNumber');
-    
-    console.log('Transaction updated successfully:', {
-      id: updatedTransaction._id,
-      type: updatedTransaction.type,
-      amount: updatedTransaction.amount,
-      balanceBefore: updatedTransaction.balanceBefore,
-      balanceAfter: updatedTransaction.balanceAfter
-    });
     
     res.status(200).json({
       status: 'success',
@@ -486,16 +558,6 @@ router.put('/:id', auth, async (req, res) => {
     });
   } catch (err) {
     console.error('Error updating transaction:', err);
-    
-    if (err.name === 'ValidationError') {
-      const errors = Object.values(err.errors).map(el => el.message);
-      return res.status(400).json({
-        status: 'fail',
-        message: 'Validation error',
-        errors
-      });
-    }
-    
     res.status(500).json({
       status: 'error',
       message: 'Error updating transaction'
@@ -506,41 +568,45 @@ router.put('/:id', auth, async (req, res) => {
 // Delete a transaction
 router.delete('/:id', auth, async (req, res) => {
   try {
-    // Validate ObjectId first
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({
-        status: 'fail',
-        message: 'Invalid transaction ID format'
-      });
-    }
+    const transactionRef = db.collection('supplierTransactions').doc(req.params.id);
+    const transactionDoc = await transactionRef.get();
     
-    const transaction = await SupplierTransaction.findOne({
-      _id: req.params.id,
-      store: req.user._id
-    });
-    
-    if (!transaction) {
+    if (!transactionDoc.exists) {
       return res.status(404).json({
         status: 'fail',
         message: 'Transaction not found'
       });
     }
     
-    // Check for subsequent transactions
-    const hasSubsequentTransactions = await SupplierTransaction.exists({
-      supplier: transaction.supplier,
-      store: req.user._id,
-      paymentDate: { $gt: transaction.paymentDate }
-    });
+    const transaction = { id: transactionDoc.id, ...transactionDoc.data() };
     
-    if (hasSubsequentTransactions) {
+    // Verify store ownership
+    if (transaction.store !== req.user.id) {
+      return res.status(403).json({
+        status: 'fail',
+        message: 'Access denied'
+      });
+    }
+    
+    // Check for subsequent transactions
+    const laterTransactions = await db.collection('supplierTransactions')
+      .where('supplierId', '==', transaction.supplierId)
+      .where('store', '==', req.user.id)
+      .where('paymentDate', '>', transaction.paymentDate)
+      .limit(1)
+      .get();
+    
+    if (!laterTransactions.empty) {
       return res.status(400).json({
         status: 'fail',
         message: 'Cannot delete transaction with subsequent transactions'
       });
     }
     
-    await SupplierTransaction.findByIdAndDelete(req.params.id);
+    await transactionRef.delete();
+    
+    // Recalculate balances for this supplier
+    await recalculateSupplierBalances(transaction.supplierId, req.user.id, req.params.id);
     
     res.status(204).json({
       status: 'success',

@@ -3,8 +3,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
-const User = require('../models/User');
-const ProductKey = require('../models/ProductKey');
+const { db } = require('../firebase');
 const router = express.Router();
 
 // Configure email transporter
@@ -42,6 +41,52 @@ const signToken = (id) => {
   });
 };
 
+// Helper function to find user by email
+const findUserByEmail = async (email) => {
+  const usersRef = db.collection('users');
+  const snapshot = await usersRef.where('email', '==', email).limit(1).get();
+  
+  if (snapshot.empty) return null;
+  
+  const doc = snapshot.docs[0];
+  return { id: doc.id, ...doc.data() };
+};
+
+// Helper function to find user by id
+const findUserById = async (id) => {
+  const userRef = db.collection('users').doc(id);
+  const userDoc = await userRef.get();
+  
+  if (!userDoc.exists) return null;
+  
+  return { id: userDoc.id, ...userDoc.data() };
+};
+
+// Helper function to update user
+const updateUser = async (id, data) => {
+  const userRef = db.collection('users').doc(id);
+  await userRef.update({
+    ...data,
+    updatedAt: new Date()
+  });
+  
+  const updatedDoc = await userRef.get();
+  return { id: updatedDoc.id, ...updatedDoc.data() };
+};
+
+// Helper function to create user
+const createUser = async (userData) => {
+  const usersRef = db.collection('users');
+  const newUser = {
+    ...userData,
+    createdAt: new Date(),
+    updatedAt: new Date()
+  };
+  
+  const docRef = await usersRef.add(newUser);
+  return { id: docRef.id, ...newUser };
+};
+
 // Forgot password - send OTP
 router.post('/forgot-password', async (req, res) => {
   try {
@@ -54,7 +99,7 @@ router.post('/forgot-password', async (req, res) => {
       });
     }
 
-    const user = await User.findOne({ email });
+    const user = await findUserByEmail(email);
     
     if (!user) {
       return res.status(200).json({
@@ -67,10 +112,10 @@ router.post('/forgot-password', async (req, res) => {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     
     // Set OTP and expiration (10 minutes)
-    user.resetPasswordOTP = otp;
-    user.resetPasswordExpires = Date.now() + 10 * 60 * 1000;
+    const resetPasswordOTP = otp;
+    const resetPasswordExpires = Date.now() + 10 * 60 * 1000;
     
-    await user.save({ validateBeforeSave: false });
+    await updateUser(user.id, { resetPasswordOTP, resetPasswordExpires });
     
     // Send email
     try {
@@ -110,9 +155,10 @@ router.post('/forgot-password', async (req, res) => {
         });
       }
       
-      user.resetPasswordOTP = undefined;
-      user.resetPasswordExpires = undefined;
-      await user.save({ validateBeforeSave: false });
+      await updateUser(user.id, { 
+        resetPasswordOTP: null, 
+        resetPasswordExpires: null 
+      });
       
       return res.status(500).json({
         status: 'fail',
@@ -140,17 +186,28 @@ router.post('/verify-otp', async (req, res) => {
       });
     }
 
-    // Find user with OTP fields explicitly selected
-    const user = await User.findOne({
-      email,
-      resetPasswordOTP: otp,
-      resetPasswordExpires: { $gt: Date.now() }
-    }).select('+resetPasswordOTP +resetPasswordExpires');
+    // Find user with matching email and OTP
+    const usersRef = db.collection('users');
+    const snapshot = await usersRef
+      .where('email', '==', email)
+      .where('resetPasswordOTP', '==', otp)
+      .limit(1)
+      .get();
 
-    if (!user) {
+    if (snapshot.empty) {
       return res.status(400).json({
         status: 'fail',
-        message: 'Invalid or expired OTP'
+        message: 'Invalid OTP'
+      });
+    }
+
+    const user = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
+    
+    // Check if OTP is expired
+    if (user.resetPasswordExpires && user.resetPasswordExpires < Date.now()) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'OTP has expired'
       });
     }
 
@@ -167,8 +224,7 @@ router.post('/verify-otp', async (req, res) => {
   }
 });
 
-// Reset password - FIXED VERSION
-// Reset password - Alternative solution using findOneAndUpdate
+// Reset password
 router.post('/reset-password', async (req, res) => {
   try {
     const { email, otp, newPassword, confirmPassword } = req.body;
@@ -194,35 +250,42 @@ router.post('/reset-password', async (req, res) => {
       });
     }
 
-    // Hash the new password manually
-    const hashedPassword = await bcrypt.hash(newPassword, 12);
+    // Find user with matching email and OTP
+    const usersRef = db.collection('users');
+    const snapshot = await usersRef
+      .where('email', '==', email)
+      .where('resetPasswordOTP', '==', otp)
+      .limit(1)
+      .get();
 
-    // Update the user directly without fetching the entire document
-    const result = await User.findOneAndUpdate(
-      {
-        email,
-        resetPasswordOTP: otp,
-        resetPasswordExpires: { $gt: Date.now() }
-      },
-      {
-        $set: {
-          password: hashedPassword,
-          resetPasswordOTP: null,
-          resetPasswordExpires: null
-        }
-      },
-      {
-        new: true, // Return the updated document
-        runValidators: false // Skip validation
-      }
-    );
-
-    if (!result) {
+    if (snapshot.empty) {
       return res.status(400).json({
         status: 'fail',
         message: 'Invalid or expired OTP'
       });
     }
+
+    const user = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
+    
+    // Check if OTP is expired
+    if (user.resetPasswordExpires && user.resetPasswordExpires < Date.now()) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'OTP has expired'
+      });
+    }
+
+    // Hash the new password
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+
+    // Update user password and clear OTP fields
+    const userRef = db.collection('users').doc(user.id);
+    await userRef.update({
+      password: hashedPassword,
+      resetPasswordOTP: null,
+      resetPasswordExpires: null,
+      updatedAt: new Date()
+    });
 
     res.status(200).json({
       status: 'success',
@@ -241,7 +304,7 @@ router.post('/reset-password', async (req, res) => {
 router.get('/debug-user/:email', async (req, res) => {
   try {
     const { email } = req.params;
-    const user = await User.findOne({ email }).select('+resetPasswordOTP +resetPasswordExpires');
+    const user = await findUserByEmail(email);
     
     if (!user) {
       return res.status(404).json({
@@ -303,54 +366,76 @@ router.post('/signup', async (req, res) => {
       });
     }
 
-    const validProductKey = await ProductKey.findOne({ 
-      key: productKey,
-      isUsed: false 
-    });
+    // Check if product key is valid
+    const productKeysRef = db.collection('productKeys');
+    const keySnapshot = await productKeysRef
+      .where('key', '==', productKey)
+      .where('isUsed', '==', false)
+      .limit(1)
+      .get();
 
-    if (!validProductKey) {
+    if (keySnapshot.empty) {
       return res.status(400).json({
         status: 'fail',
         message: 'Invalid or already used product key'
       });
     }
 
-    const existingUser = await User.findOne({
-      $or: [{ email }, { phoneNumber }]
-    });
+    const validProductKeyDoc = keySnapshot.docs[0];
+    const validProductKey = { id: validProductKeyDoc.id, ...validProductKeyDoc.data() };
 
-    if (existingUser) {
+    // Check if user already exists
+    const usersRef = db.collection('users');
+    const emailSnapshot = await usersRef.where('email', '==', email).limit(1).get();
+    const phoneSnapshot = await usersRef.where('phoneNumber', '==', phoneNumber).limit(1).get();
+
+    if (!emailSnapshot.empty || !phoneSnapshot.empty) {
       return res.status(400).json({
         status: 'fail',
         message: 'User with this email or phone number already exists'
       });
     }
 
-    const newUser = await User.create({
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 12);
+
+    // Create new user
+    const newUser = await createUser({
       fullName,
       phoneNumber,
       email,
-      password,
+      password: hashedPassword,
       storeName,
       storeType,
       address,
-      panVatNumber: panVatNumber || undefined,
-      productKey
+      panVatNumber: panVatNumber || null,
+      productKey,
+      role: 'admin',
+      createdAt: new Date(),
+      updatedAt: new Date()
     });
 
-    validProductKey.isUsed = true;
-    validProductKey.usedAt = new Date();
-    validProductKey.usedBy = newUser._id;
-    await validProductKey.save();
+    // Mark product key as used
+    const productKeyRef = db.collection('productKeys').doc(validProductKey.id);
+    await productKeyRef.update({
+      isUsed: true,
+      usedAt: new Date(),
+      usedBy: newUser.id
+    });
 
-    const token = signToken(newUser._id);
+    // Generate token
+    const token = signToken(newUser.id);
+
+    // Remove password from response
+    const { password: _, ...userWithoutPassword } = newUser;
 
     res.status(201).json({
       status: 'success',
       token,
-      data: { user: newUser }
+      data: { user: userWithoutPassword }
     });
   } catch (err) {
+    console.error('Signup error:', err);
     res.status(400).json({
       status: 'fail',
       message: err.message
@@ -372,7 +457,8 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    const user = await User.findOne({ email }).select('+password');
+    // Find user by email
+    const user = await findUserByEmail(email);
     
     if (!user) {
       return res.status(401).json({
@@ -381,7 +467,8 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    const isPasswordCorrect = await user.correctPassword(password);
+    // Compare password
+    const isPasswordCorrect = await bcrypt.compare(password, user.password);
     
     if (!isPasswordCorrect) {
       return res.status(401).json({
@@ -390,12 +477,16 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    const token = signToken(user._id);
+    // Generate token
+    const token = signToken(user.id);
+
+    // Remove password from response
+    const { password: _, ...userWithoutPassword } = user;
 
     res.status(200).json({
       status: 'success',
       token,
-      data: { user: { ...user.toObject(), password: undefined } }
+      data: { user: userWithoutPassword }
     });
   } catch (err) {
     console.error('Login error:', err);
@@ -420,7 +511,7 @@ router.post('/verify-password', async (req, res) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id).select('+password');
+    const user = await findUserById(decoded.id);
     
     if (!user) {
       return res.status(404).json({
@@ -429,7 +520,7 @@ router.post('/verify-password', async (req, res) => {
       });
     }
 
-    const isPasswordCorrect = await user.correctPassword(password);
+    const isPasswordCorrect = await bcrypt.compare(password, user.password);
     
     if (isPasswordCorrect) {
       res.status(200).json({
@@ -465,7 +556,7 @@ router.get('/me', async (req, res) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id);
+    const user = await findUserById(decoded.id);
 
     if (!user) {
       return res.status(404).json({
@@ -474,11 +565,15 @@ router.get('/me', async (req, res) => {
       });
     }
 
+    // Remove password from response
+    const { password, ...userWithoutPassword } = user;
+
     res.status(200).json({
       status: 'success',
-      data: { user }
+      data: { user: userWithoutPassword }
     });
   } catch (err) {
+    console.error('Get me error:', err);
     res.status(401).json({
       status: 'fail',
       message: 'Invalid token'

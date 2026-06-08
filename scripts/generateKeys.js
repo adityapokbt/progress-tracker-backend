@@ -1,4 +1,6 @@
+require('dotenv').config();
 const { db } = require('../firebase');
+const { writeBatch, collection, doc, getDocs, query, limit } = require('firebase/firestore');
 
 const generateProductKey = () => {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -20,15 +22,16 @@ const generateKeys = async () => {
     const totalKeys = 500;
     const batchSize = 100;
     
-    console.log('🚀 Starting product key generation on Render...');
-    console.log(`📊 Total keys to generate: ${totalKeys}`);
+    console.log('🚀 Generating 500 product keys...');
+    console.log(`📊 Using Firebase Project: ${process.env.FIREBASE_PROJECT_ID}`);
+    console.log(`📊 Firebase API Key exists: ${!!process.env.FIREBASE_API_KEY}`);
 
-    let batch = db.batch();
+    let batch = writeBatch(db);
     let batchCount = 0;
     
     for (let i = 0; i < totalKeys; i++) {
       const key = generateProductKey();
-      const docRef = db.collection('productKeys').doc();
+      const docRef = doc(collection(db, 'productKeys'));
       
       batch.set(docRef, {
         key,
@@ -42,22 +45,23 @@ const generateKeys = async () => {
       if (batchCount === batchSize || i === totalKeys - 1) {
         await batch.commit();
         console.log(`✓ Generated ${i + 1}/${totalKeys} keys`);
-        batch = db.batch();
+        batch = writeBatch(db);
         batchCount = 0;
       }
     }
 
-    console.log('\n✅ SUCCESS: 500 product keys created successfully!');
+    console.log('\n✅ SUCCESS: 500 product keys created!');
     
     // Display sample keys
-    const snapshot = await db.collection('productKeys').limit(5).get();
+    const q = query(collection(db, 'productKeys'), limit(5));
+    const snapshot = await getDocs(q);
     console.log('\n📝 Sample product keys (first 5):');
     let index = 1;
     snapshot.forEach(doc => {
       console.log(`${index++}. ${doc.data().key}`);
     });
     
-    console.log('\n🎉 Keys are ready for user signup!');
+    console.log('\n🎉 Keys are ready! You can now use them for signup.');
     process.exit(0);
 
   } catch (err) {

@@ -1,7 +1,7 @@
 const express = require('express');
 const auth = require('../middleware/auth');
-const Product = require('../models/Product');
-const Settings = require('../models/Settings');
+const { db } = require('../firebase');
+const { FieldValue } = require('firebase-admin/firestore');
 const router = express.Router();
 
 // Default inventory options (fallback if no settings found)
@@ -17,12 +17,68 @@ const defaultInventoryOptions = {
   colors: ["Black", "White", "Red", "Blue", "Green", "Yellow", "Pink", "Purple", "Brown", "Gray", "Multi"]
 };
 
+// Helper function to get products collection with store filter
+const getProductsQuery = (storeId) => {
+  return db.collection('products').where('store', '==', storeId);
+};
+
+// Helper function to find product by ID and store
+const findProductById = async (id, storeId) => {
+  const productRef = db.collection('products').doc(id);
+  const productDoc = await productRef.get();
+  
+  if (!productDoc.exists) return null;
+  
+  const product = { id: productDoc.id, ...productDoc.data() };
+  
+  // Verify store ownership
+  if (product.store !== storeId) return null;
+  
+  return product;
+};
+
+// Helper function to create a product
+const createProduct = async (productData) => {
+  const productsRef = db.collection('products');
+  const newProduct = {
+    ...productData,
+    createdAt: new Date(),
+    updatedAt: new Date()
+  };
+  
+  const docRef = await productsRef.add(newProduct);
+  return { id: docRef.id, ...newProduct };
+};
+
+// Helper function to update a product
+const updateProduct = async (id, productData) => {
+  const productRef = db.collection('products').doc(id);
+  await productRef.update({
+    ...productData,
+    updatedAt: new Date()
+  });
+  
+  const updatedDoc = await productRef.get();
+  return { id: updatedDoc.id, ...updatedDoc.data() };
+};
+
+// Helper function to delete a product
+const deleteProduct = async (id) => {
+  const productRef = db.collection('products').doc(id);
+  await productRef.delete();
+};
+
 const getInventoryOptions = async (storeId) => {
   try {
     // Try to fetch settings from database
-    const settings = await Settings.findOne({ store: storeId });
-    if (settings && settings.inventoryOptions) {
-      return settings.inventoryOptions;
+    const settingsRef = db.collection('settings');
+    const snapshot = await settingsRef.where('store', '==', storeId).limit(1).get();
+    
+    if (!snapshot.empty) {
+      const settings = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
+      if (settings.inventoryOptions) {
+        return settings.inventoryOptions;
+      }
     }
     
     // Fallback to default options
@@ -48,7 +104,14 @@ const validateProductData = async (req, res, next) => {
 // Get all products for the authenticated user's store
 router.get('/', auth, async (req, res) => {
   try {
-    const products = await Product.find({ store: req.user._id });
+    const productsRef = db.collection('products');
+    const snapshot = await productsRef.where('store', '==', req.user.id).get();
+    
+    const products = [];
+    snapshot.forEach(doc => {
+      products.push({ id: doc.id, ...doc.data() });
+    });
+    
     res.status(200).json({
       status: 'success',
       results: products.length,
@@ -66,10 +129,7 @@ router.get('/', auth, async (req, res) => {
 // Get a specific product
 router.get('/:id', auth, async (req, res) => {
   try {
-    const product = await Product.findOne({ 
-      _id: req.params.id, 
-      store: req.user._id 
-    });
+    const product = await findProductById(req.params.id, req.user.id);
     
     if (!product) {
       return res.status(404).json({
@@ -99,10 +159,10 @@ router.post('/', auth, validateProductData, async (req, res) => {
     // Add the store ID to the product data
     const productData = {
       ...req.body,
-      store: req.user._id
+      store: req.user.id
     };
     
-    const product = await Product.create(productData);
+    const product = await createProduct(productData);
     
     res.status(201).json({
       status: 'success',
@@ -141,18 +201,17 @@ router.put('/:id', auth, validateProductData, async (req, res) => {
   try {
     console.log('Updating product with data:', req.body);
     
-    const product = await Product.findOneAndUpdate(
-      { _id: req.params.id, store: req.user._id },
-      req.body,
-      { new: true, runValidators: true }
-    );
+    // Check if product exists and belongs to store
+    const existingProduct = await findProductById(req.params.id, req.user.id);
     
-    if (!product) {
+    if (!existingProduct) {
       return res.status(404).json({
         status: 'fail',
         message: 'Product not found'
       });
     }
+    
+    const product = await updateProduct(req.params.id, req.body);
     
     res.status(200).json({
       status: 'success',
@@ -189,17 +248,17 @@ router.put('/:id', auth, validateProductData, async (req, res) => {
 // Delete a product
 router.delete('/:id', auth, async (req, res) => {
   try {
-    const product = await Product.findOneAndDelete({
-      _id: req.params.id,
-      store: req.user._id
-    });
+    // Check if product exists and belongs to store
+    const existingProduct = await findProductById(req.params.id, req.user.id);
     
-    if (!product) {
+    if (!existingProduct) {
       return res.status(404).json({
         status: 'fail',
         message: 'Product not found'
       });
     }
+    
+    await deleteProduct(req.params.id);
     
     res.status(204).json({
       status: 'success',
@@ -215,14 +274,20 @@ router.delete('/:id', auth, async (req, res) => {
 });
 
 // Get low stock products
-
 router.get('/low-stock', auth, async (req, res) => {
   try {
-    const lowStockProducts = await Product.find({
-      store: req.user._id,
-      stock: { $ne: 0 },
-      $expr: { $lte: ['$stock', '$lowStockAlert'] }
+    const productsRef = db.collection('products');
+    const snapshot = await productsRef.where('store', '==', req.user.id).get();
+    
+    const lowStockProducts = [];
+    snapshot.forEach(doc => {
+      const product = { id: doc.id, ...doc.data() };
+      // Check if stock is low (stock > 0 and stock <= lowStockAlert)
+      if (product.stock && product.stock > 0 && product.lowStockAlert && product.stock <= product.lowStockAlert) {
+        lowStockProducts.push(product);
+      }
     });
+    
     res.status(200).json({
       status: 'success',
       results: lowStockProducts.length,
@@ -237,26 +302,31 @@ router.get('/low-stock', auth, async (req, res) => {
   }
 });
 
-// Get inventory options for the current store
+// Check SKU uniqueness
 router.get('/check/sku/:sku', auth, async (req, res) => {
   try {
     const { sku } = req.params;
     const { exclude } = req.query;
     
-    const query = { 
-      sku: sku,
-      store: req.user._id
-    };
+    let query = db.collection('products')
+      .where('sku', '==', sku)
+      .where('store', '==', req.user.id);
     
-    if (exclude) {
-      query._id = { $ne: exclude };
+    const snapshot = await query.get();
+    
+    let isUnique = snapshot.empty;
+    
+    // If there's an exclude ID and we found a product, check if it's the excluded one
+    if (!isUnique && exclude) {
+      const foundDoc = snapshot.docs[0];
+      if (foundDoc.id === exclude) {
+        isUnique = true;
+      }
     }
-    
-    const existingProduct = await Product.findOne(query);
     
     res.status(200).json({
       status: 'success',
-      data: { unique: !existingProduct }
+      data: { unique: isUnique }
     });
   } catch (err) {
     console.error('Error checking SKU uniqueness:', err);
@@ -266,25 +336,32 @@ router.get('/check/sku/:sku', auth, async (req, res) => {
     });
   }
 });
+
+// Check barcode uniqueness
 router.get('/check/barcode/:barcode', auth, async (req, res) => {
   try {
     const { barcode } = req.params;
     const { exclude } = req.query;
     
-    const query = { 
-      barcode: barcode,
-      store: req.user._id
-    };
+    let query = db.collection('products')
+      .where('barcode', '==', barcode)
+      .where('store', '==', req.user.id);
     
-    if (exclude) {
-      query._id = { $ne: exclude };
+    const snapshot = await query.get();
+    
+    let isUnique = snapshot.empty;
+    
+    // If there's an exclude ID and we found a product, check if it's the excluded one
+    if (!isUnique && exclude) {
+      const foundDoc = snapshot.docs[0];
+      if (foundDoc.id === exclude) {
+        isUnique = true;
+      }
     }
-    
-    const existingProduct = await Product.findOne(query);
     
     res.status(200).json({
       status: 'success',
-      data: { unique: !existingProduct }
+      data: { unique: isUnique }
     });
   } catch (err) {
     console.error('Error checking barcode uniqueness:', err);
@@ -294,9 +371,11 @@ router.get('/check/barcode/:barcode', auth, async (req, res) => {
     });
   }
 });
+
+// Get inventory options
 router.get('/options/inventory', auth, async (req, res) => {
   try {
-    const inventoryOptions = await getInventoryOptions(req.user._id);
+    const inventoryOptions = await getInventoryOptions(req.user.id);
     
     res.status(200).json({
       status: 'success',
@@ -310,11 +389,14 @@ router.get('/options/inventory', auth, async (req, res) => {
     });
   }
 });
-// routes/inventory.js
 
+// Get total product count
 router.get('/count', auth, async (req, res) => {
   try {
-    const totalProducts = await Product.countDocuments({ store: req.user._id });
+    const productsRef = db.collection('products');
+    const snapshot = await productsRef.where('store', '==', req.user.id).get();
+    const totalProducts = snapshot.size;
+    
     res.status(200).json({
       status: 'success',
       data: { totalProducts }
@@ -331,7 +413,17 @@ router.get('/count', auth, async (req, res) => {
 // Get out-of-stock product count
 router.get('/out-of-stock/count', auth, async (req, res) => {
   try {
-    const outOfStock = await Product.countDocuments({ store: req.user._id, stock: 0 });
+    const productsRef = db.collection('products');
+    const snapshot = await productsRef.where('store', '==', req.user.id).get();
+    
+    let outOfStock = 0;
+    snapshot.forEach(doc => {
+      const product = doc.data();
+      if (product.stock === 0 || product.stock === undefined) {
+        outOfStock++;
+      }
+    });
+    
     res.status(200).json({
       status: 'success',
       data: { outOfStock }
@@ -341,6 +433,80 @@ router.get('/out-of-stock/count', auth, async (req, res) => {
     res.status(500).json({
       status: 'error',
       message: 'Error fetching out-of-stock product count'
+    });
+  }
+});
+
+// Get categories (distinct category values from products)
+router.get('/categories/list', auth, async (req, res) => {
+  try {
+    const productsRef = db.collection('products');
+    const snapshot = await productsRef.where('store', '==', req.user.id).get();
+    
+    const categories = new Set();
+    snapshot.forEach(doc => {
+      const product = doc.data();
+      if (product.category) {
+        categories.add(product.category);
+      }
+    });
+    
+    res.status(200).json({
+      status: 'success',
+      data: { categories: Array.from(categories).sort() }
+    });
+  } catch (err) {
+    console.error('Error fetching categories:', err);
+    res.status(500).json({
+      status: 'error',
+      message: 'Error fetching categories'
+    });
+  }
+});
+
+// Bulk update stock levels
+router.patch('/bulk-stock', auth, async (req, res) => {
+  try {
+    const { updates } = req.body; // Array of { id, stock }
+    
+    if (!updates || !Array.isArray(updates)) {
+      return res.status(400).json({
+        status: 'fail',
+        message: 'Updates array is required'
+      });
+    }
+    
+    const batch = db.batch();
+    const results = [];
+    
+    for (const update of updates) {
+      const { id, stock } = update;
+      
+      // Verify product belongs to store
+      const product = await findProductById(id, req.user.id);
+      if (product) {
+        const productRef = db.collection('products').doc(id);
+        batch.update(productRef, {
+          stock: stock,
+          updatedAt: new Date()
+        });
+        results.push({ id, success: true });
+      } else {
+        results.push({ id, success: false, error: 'Product not found or unauthorized' });
+      }
+    }
+    
+    await batch.commit();
+    
+    res.status(200).json({
+      status: 'success',
+      data: { results }
+    });
+  } catch (err) {
+    console.error('Error bulk updating stock:', err);
+    res.status(500).json({
+      status: 'error',
+      message: 'Error bulk updating stock'
     });
   }
 });

@@ -1,24 +1,50 @@
-const Leave = require('../models/Leave');
-const Staff = require('../models/Staff');
+const { db } = require('../firebase');
+const { FieldValue } = require('firebase-admin/firestore');
+
+// Helper function to find staff by ID and store
+const findStaffById = async (id, storeId) => {
+  const staffRef = db.collection('staff').doc(id);
+  const staffDoc = await staffRef.get();
+  
+  if (!staffDoc.exists) return null;
+  const staff = { id: staffDoc.id, ...staffDoc.data() };
+  if (staff.store !== storeId) return null;
+  return staff;
+};
 
 // Get leave requests
 exports.getLeaveRequests = async (req, res) => {
   try {
     const { page = 1, limit = 10, status, type } = req.query;
     
-    const query = { user: req.user._id };
+    let query = db.collection('leaves')
+      .where('store', '==', req.user.id);
     
-    if (status) query.status = status;
-    if (type) query.type = type;
+    if (status) query = query.where('status', '==', status);
+    if (type) query = query.where('type', '==', type);
     
-    const leaveRequests = await Leave.find(query)
-      .populate('staff', 'name position')
-      .populate('approvedBy', 'name')
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .sort({ createdAt: -1 });
+    const snapshot = await query
+      .orderBy('createdAt', 'desc')
+      .limit(parseInt(limit))
+      .get();
     
-    const total = await Leave.countDocuments(query);
+    const leaveRequests = [];
+    for (const doc of snapshot.docs) {
+      const leave = { id: doc.id, ...doc.data() };
+      
+      // Fetch staff details
+      const staff = await findStaffById(leave.staffId, req.user.id);
+      if (staff) {
+        leave.staff = { id: staff.id, name: staff.name, position: staff.position };
+      }
+      
+      leaveRequests.push(leave);
+    }
+    
+    const totalSnapshot = await db.collection('leaves')
+      .where('store', '==', req.user.id)
+      .get();
+    const total = totalSnapshot.size;
     
     res.status(200).json({
       success: true,
@@ -32,6 +58,7 @@ exports.getLeaveRequests = async (req, res) => {
       }
     });
   } catch (err) {
+    console.error('Error fetching leave requests:', err);
     res.status(500).json({
       success: false,
       message: 'Error fetching leave requests',
@@ -45,8 +72,8 @@ exports.requestLeave = async (req, res) => {
   try {
     const { staffId, type, startDate, endDate, reason } = req.body;
     
-    // Validate staff exists and belongs to the same user
-    const staff = await Staff.findOne({ _id: staffId, user: req.user._id });
+    // Validate staff exists and belongs to the same store
+    const staff = await findStaffById(staffId, req.user.id);
     if (!staff) {
       return res.status(404).json({
         success: false,
@@ -54,16 +81,31 @@ exports.requestLeave = async (req, res) => {
       });
     }
     
-    // Check for overlapping leave requests
-    const overlappingLeave = await Leave.findOne({
-      staff: staffId,
-      status: { $in: ['pending', 'approved'] },
-      $or: [
-        { startDate: { $lte: new Date(endDate) }, endDate: { $gte: new Date(startDate) } }
-      ]
-    });
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
     
-    if (overlappingLeave) {
+    // Check for overlapping leave requests
+    const overlappingSnapshot = await db.collection('leaves')
+      .where('staffId', '==', staffId)
+      .where('store', '==', req.user.id)
+      .where('status', 'in', ['pending', 'approved'])
+      .get();
+    
+    let hasOverlap = false;
+    for (const doc of overlappingSnapshot.docs) {
+      const existing = doc.data();
+      const existingStart = existing.startDate.toDate();
+      const existingEnd = existing.endDate.toDate();
+      
+      if ((start <= existingEnd && end >= existingStart)) {
+        hasOverlap = true;
+        break;
+      }
+    }
+    
+    if (hasOverlap) {
       return res.status(400).json({
         success: false,
         message: 'Overlapping leave request exists'
@@ -71,24 +113,30 @@ exports.requestLeave = async (req, res) => {
     }
     
     const leaveData = {
-      staff: staffId,
+      staffId,
+      staffName: staff.name,
+      store: req.user.id,
       type,
-      startDate: new Date(startDate),
-      endDate: new Date(endDate),
-      reason,
-      user: req.user._id,
-      createdBy: req.user._id
+      startDate: start,
+      endDate: end,
+      reason: reason || '',
+      status: 'pending',
+      createdBy: req.user.id,
+      createdAt: new Date(),
+      updatedAt: new Date()
     };
     
-    const leaveRequest = await Leave.create(leaveData);
-    await leaveRequest.populate('staff', 'name position');
+    const leavesRef = db.collection('leaves');
+    const docRef = await leavesRef.add(leaveData);
+    const newLeave = { id: docRef.id, ...leaveData };
     
     res.status(201).json({
       success: true,
       message: 'Leave request submitted successfully',
-      data: { leaveRequest }
+      data: { leaveRequest: newLeave }
     });
   } catch (err) {
+    console.error('Error submitting leave request:', err);
     res.status(500).json({
       success: false,
       message: 'Error submitting leave request',
@@ -102,35 +150,41 @@ exports.updateLeaveStatus = async (req, res) => {
   try {
     const { status, rejectionReason } = req.body;
     
-    const leaveRequest = await Leave.findById(req.params.id)
-      .populate('staff', 'name position');
+    const leaveRef = db.collection('leaves').doc(req.params.id);
+    const leaveDoc = await leaveRef.get();
     
-    if (!leaveRequest) {
+    if (!leaveDoc.exists) {
       return res.status(404).json({
         success: false,
         message: 'Leave request not found'
       });
     }
     
-    // Check if leave belongs to the same user
-    if (leaveRequest.user.toString() !== req.user._id.toString()) {
+    const leave = leaveDoc.data();
+    
+    // Check if leave belongs to the same store
+    if (leave.store !== req.user.id) {
       return res.status(403).json({
         success: false,
         message: 'Access denied'
       });
     }
     
-    leaveRequest.status = status;
+    const updateData = {
+      status,
+      updatedAt: new Date()
+    };
     
     if (status === 'approved') {
-      leaveRequest.approvedBy = req.user._id;
-      leaveRequest.rejectionReason = undefined;
+      updateData.approvedBy = req.user.id;
+      updateData.rejectionReason = null;
     } else if (status === 'rejected') {
-      leaveRequest.rejectionReason = rejectionReason;
+      updateData.rejectionReason = rejectionReason;
     }
     
-    const updatedLeave = await leaveRequest.save();
-    await updatedLeave.populate('approvedBy', 'name');
+    await leaveRef.update(updateData);
+    const updatedDoc = await leaveRef.get();
+    const updatedLeave = { id: updatedDoc.id, ...updatedDoc.data() };
     
     res.status(200).json({
       success: true,
@@ -138,6 +192,7 @@ exports.updateLeaveStatus = async (req, res) => {
       data: { leaveRequest: updatedLeave }
     });
   } catch (err) {
+    console.error('Error updating leave request:', err);
     res.status(500).json({
       success: false,
       message: 'Error updating leave request',
@@ -151,8 +206,8 @@ exports.getLeaveBalance = async (req, res) => {
   try {
     const { staffId } = req.params;
     
-    // Validate staff exists and belongs to the same user
-    const staff = await Staff.findOne({ _id: staffId, user: req.user._id });
+    // Validate staff exists and belongs to the same store
+    const staff = await findStaffById(staffId, req.user.id);
     if (!staff) {
       return res.status(404).json({
         success: false,
@@ -161,48 +216,57 @@ exports.getLeaveBalance = async (req, res) => {
     }
     
     const currentYear = new Date().getFullYear();
+    const startOfYear = new Date(currentYear, 0, 1);
+    const endOfYear = new Date(currentYear, 11, 31);
+    endOfYear.setHours(23, 59, 59, 999);
     
     // Get approved leave for current year
-    const approvedLeave = await Leave.find({
-      staff: staffId,
-      status: 'approved',
-      startDate: { $gte: new Date(currentYear, 0, 1) },
-      endDate: { $lte: new Date(currentYear, 11, 31) }
-    });
+    const snapshot = await db.collection('leaves')
+      .where('staffId', '==', staffId)
+      .where('store', '==', req.user.id)
+      .where('status', '==', 'approved')
+      .where('startDate', '>=', startOfYear)
+      .where('endDate', '<=', endOfYear)
+      .get();
     
     // Calculate total leave days
-    const totalLeaveDays = approvedLeave.reduce((total, leave) => {
-      const duration = Math.ceil((leave.endDate - leave.startDate) / (1000 * 60 * 60 * 24)) + 1;
-      return total + duration;
-    }, 0);
+    let totalLeaveDays = 0;
+    for (const doc of snapshot.docs) {
+      const leave = doc.data();
+      const start = leave.startDate.toDate();
+      const end = leave.endDate.toDate();
+      const duration = Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1;
+      totalLeaveDays += duration;
+    }
     
-    // Standard leave entitlements (customize as needed)
+    // Standard leave entitlements
     const leaveEntitlements = {
-      annual: 18,
-      sick: 12,
-      maternity: 98,
-      paternity: 15
+      annual: staff.annualLeaveDays || 18,
+      sick: staff.sickLeaveDays || 12,
+      maternity: staff.maternityLeaveDays || 98,
+      paternity: staff.paternityLeaveDays || 15
     };
     
     res.status(200).json({
       success: true,
       data: {
         staff: {
+          id: staff.id,
           name: staff.name,
           position: staff.position
         },
         leaveBalance: {
-          annual: leaveEntitlements.annual - totalLeaveDays,
+          annual: leaveEntitlements.annual,
           sick: leaveEntitlements.sick,
           maternity: leaveEntitlements.maternity,
           paternity: leaveEntitlements.paternity,
           used: totalLeaveDays,
-          remaining: leaveEntitlements.annual - totalLeaveDays
-        },
-        leaveHistory: approvedLeave
+          remaining: Math.max(0, leaveEntitlements.annual - totalLeaveDays)
+        }
       }
     });
   } catch (err) {
+    console.error('Error fetching leave balance:', err);
     res.status(500).json({
       success: false,
       message: 'Error fetching leave balance',

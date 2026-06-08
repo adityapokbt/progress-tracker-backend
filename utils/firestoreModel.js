@@ -1,4 +1,17 @@
-const { db, admin } = require('../firebase');
+const { db } = require('../firebase');
+const {
+  collection,
+  doc,
+  addDoc,
+  setDoc,
+  getDoc,
+  getDocs,
+  updateDoc,
+  deleteDoc,
+  query,
+  where,
+  writeBatch,
+} = require('firebase/firestore');
 
 const POPULATE_MAP = {
   user: { collection: 'users', model: 'User' },
@@ -44,7 +57,7 @@ function normalizeId(id) {
 }
 
 function docFromSnapshot(snapshot, Model) {
-  if (!snapshot.exists) return null;
+  if (!snapshot.exists()) return null;
   const data = snapshot.data();
   return Model.hydrate({ ...data, _id: snapshot.id, id: snapshot.id });
 }
@@ -330,7 +343,7 @@ function createModel(collectionName, options = {}) {
       delete payload.id;
 
       if (this._isNew) {
-        const ref = await db.collection(collectionName).add(payload);
+        const ref = await addDoc(collection(db, collectionName), payload);
         this._id = ref.id;
         this.id = ref.id;
         this._isNew = false;
@@ -339,7 +352,7 @@ function createModel(collectionName, options = {}) {
         return this;
       }
 
-      await db.collection(collectionName).doc(this._id).update(payload);
+      await updateDoc(doc(db, collectionName, this._id), payload);
       this._original = this.toObject();
       this._modifiedPaths.clear();
       return this;
@@ -380,43 +393,47 @@ function createModel(collectionName, options = {}) {
   };
 
   Model._fetchAll = async function _fetchAll() {
-    const snapshot = await db.collection(collectionName).get();
+    const snapshot = await getDocs(collection(db, collectionName));
     return snapshot.docs.map((snap) => docFromSnapshot(snap, Model));
   };
 
   Model._fetchWithSimpleFilters = async function _fetchWithSimpleFilters(filter = {}) {
-    let queryRef = db.collection(collectionName);
+    let constraints = [];
     const memoryFilter = { ...filter };
 
     Object.entries(filter).forEach(([key, value]) => {
       if (key === '$or' || key === '$expr') return;
       if (value && typeof value === 'object' && !Array.isArray(value)) {
         if (value.$gte !== undefined) {
-          queryRef = queryRef.where(key, '>=', value.$gte);
+          constraints.push(where(key, '>=', value.$gte));
           delete memoryFilter[key];
         } else if (value.$gt !== undefined) {
-          queryRef = queryRef.where(key, '>', value.$gt);
+          constraints.push(where(key, '>', value.$gt));
           delete memoryFilter[key];
         } else if (value.$lte !== undefined) {
-          queryRef = queryRef.where(key, '<=', value.$lte);
+          constraints.push(where(key, '<=', value.$lte));
           delete memoryFilter[key];
         } else if (value.$lt !== undefined) {
-          queryRef = queryRef.where(key, '<', value.$lt);
+          constraints.push(where(key, '<', value.$lt));
           delete memoryFilter[key];
-        } else if (value.$regex || value.$elemMatch || value.$exists !== undefined || value.$in || value.$ne) {
-          return;
         } else {
-          queryRef = queryRef.where(key, '==', value);
+          constraints.push(where(key, '==', value));
           delete memoryFilter[key];
         }
       } else if (key !== '_id' && key !== 'id') {
-        queryRef = queryRef.where(key, '==', value);
+        constraints.push(where(key, '==', value));
         delete memoryFilter[key];
       }
     });
 
-    const snapshot = await queryRef.get();
-    let docs = snapshot.docs.map((snap) => docFromSnapshot(snap, Model));
+    let docs;
+    if (constraints.length > 0) {
+      const q = query(collection(db, collectionName), ...constraints);
+      const snapshot = await getDocs(q);
+      docs = snapshot.docs.map((snap) => docFromSnapshot(snap, Model));
+    } else {
+      docs = await Model._fetchAll();
+    }
 
     if (Object.keys(memoryFilter).length > 0 || filter.$or) {
       docs = docs.filter((docItem) => matchesFilter(docItem, { ...memoryFilter, $or: filter.$or }));
@@ -491,27 +508,27 @@ function createModel(collectionName, options = {}) {
     delete payload.id;
 
     if (opts.upsert && !existing) {
-      const ref = await db.collection(collectionName).add(payload);
+      const ref = await addDoc(collection(db, collectionName), payload);
       return Model.hydrate({ ...payload, _id: ref.id, id: ref.id });
     }
 
-    await db.collection(collectionName).doc(id).set(payload, { merge: true });
+    await setDoc(doc(db, collectionName, id), payload, { merge: true });
     const result = Model.hydrate({ ...payload, _id: id, id });
     return opts.new === false ? existing : result;
   };
 
   Model.findByIdAndUpdate = async function findByIdAndUpdate(id, update, opts = {}) {
     const docId = normalizeId(id);
-    const snap = await db.collection(collectionName).doc(docId).get();
-    if (!snap.exists) return null;
+    const snap = await getDoc(doc(db, collectionName, docId));
+    if (!snap.exists()) return null;
 
     if (update.$inc) {
       const incPayload = {};
       Object.entries(update.$inc).forEach(([key, value]) => {
-        incPayload[key] = admin.firestore.FieldValue.increment(value);
+        incPayload[key] = value;
       });
-      await db.collection(collectionName).doc(docId).update(incPayload);
-      const refreshed = await db.collection(collectionName).doc(docId).get();
+      await updateDoc(doc(db, collectionName, docId), incPayload);
+      const refreshed = await getDoc(doc(db, collectionName, docId));
       const result = docFromSnapshot(refreshed, Model);
       return opts.new === false ? docFromSnapshot(snap, Model) : result;
     }
@@ -523,7 +540,7 @@ function createModel(collectionName, options = {}) {
     const docs = await Model._fetchWithSimpleFilters(filter);
     const existing = docs[0];
     if (!existing) return null;
-    await db.collection(collectionName).doc(existing._id).delete();
+    await deleteDoc(doc(db, collectionName, existing._id));
     return existing;
   };
 
@@ -532,11 +549,11 @@ function createModel(collectionName, options = {}) {
   };
 
   Model.insertMany = async function insertMany(items = []) {
-    const batch = db.batch();
+    const batch = writeBatch(db);
     const created = [];
 
     items.forEach((item) => {
-      const ref = db.collection(collectionName).doc();
+      const ref = doc(collection(db, collectionName));
       const payload = stripUndefined({ ...item });
       delete payload._id;
       delete payload.id;
@@ -619,8 +636,8 @@ class Query {
 
     if (this.options.byId) {
       const id = normalizeId(this.filter._id || this.filter.id);
-      const snap = await db.collection(this.Model.collectionName).doc(id).get();
-      docs = snap.exists ? [docFromSnapshot(snap, this.Model)] : [];
+      const snap = await getDoc(doc(db, this.Model.collectionName, id));
+      docs = snap.exists() ? [docFromSnapshot(snap, this.Model)] : [];
       docs = docs.filter((docItem) => matchesFilter(docItem, this.filter));
     } else {
       docs = await this.Model._fetchWithSimpleFilters(this.filter);
@@ -666,8 +683,8 @@ async function populateDocs(docs, path, selectFields) {
 
   const relatedDocs = new Map();
   await Promise.all(ids.map(async (id) => {
-    const snap = await db.collection(populateInfo.collection).doc(id).get();
-    if (!snap.exists) return;
+    const snap = await getDoc(doc(db, populateInfo.collection, id));
+    if (!snap.exists()) return;
     const data = { ...snap.data(), _id: snap.id, id: snap.id };
     if (selectFields) {
       const fields = selectFields.split(' ').filter(Boolean);
