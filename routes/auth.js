@@ -108,16 +108,11 @@ router.post('/forgot-password', async (req, res) => {
       });
     }
 
-    // Generate 6-digit OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    
-    // Set OTP and expiration (10 minutes)
-    const resetPasswordOTP = otp;
     const resetPasswordExpires = Date.now() + 10 * 60 * 1000;
     
-    await updateUser(user.id, { resetPasswordOTP, resetPasswordExpires });
+    await updateUser(user.id, { resetPasswordOTP: otp, resetPasswordExpires });
     
-    // Send email
     try {
       const mailOptions = {
         from: process.env.EMAIL_USER || 'noreply@pos-saas.com',
@@ -126,14 +121,12 @@ router.post('/forgot-password', async (req, res) => {
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
             <h2 style="color: #333;">Password Reset Request</h2>
-            <p>You requested to reset your password for your POS System account. Use the OTP code below to reset your password:</p>
+            <p>Use the OTP code below to reset your password:</p>
             <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; text-align: center; margin: 20px 0;">
               <h3 style="margin: 0; color: #333; letter-spacing: 3px;">${otp}</h3>
             </div>
             <p>This OTP will expire in 10 minutes.</p>
             <p>If you didn't request this reset, please ignore this email.</p>
-            <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
-            <p style="color: #888; font-size: 12px;">This is an automated message, please do not reply.</p>
           </div>
         `
       };
@@ -147,18 +140,7 @@ router.post('/forgot-password', async (req, res) => {
     } catch (emailError) {
       console.error('Email sending error:', emailError);
       
-      if (process.env.NODE_ENV === 'development') {
-        return res.status(200).json({
-          status: 'success',
-          message: 'OTP sent to your email',
-          debugOtp: otp
-        });
-      }
-      
-      await updateUser(user.id, { 
-        resetPasswordOTP: null, 
-        resetPasswordExpires: null 
-      });
+      await updateUser(user.id, { resetPasswordOTP: null, resetPasswordExpires: null });
       
       return res.status(500).json({
         status: 'fail',
@@ -186,7 +168,6 @@ router.post('/verify-otp', async (req, res) => {
       });
     }
 
-    // Find user with matching email and OTP
     const usersRef = db.collection('users');
     const snapshot = await usersRef
       .where('email', '==', email)
@@ -203,7 +184,6 @@ router.post('/verify-otp', async (req, res) => {
 
     const user = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
     
-    // Check if OTP is expired
     if (user.resetPasswordExpires && user.resetPasswordExpires < Date.now()) {
       return res.status(400).json({
         status: 'fail',
@@ -250,7 +230,6 @@ router.post('/reset-password', async (req, res) => {
       });
     }
 
-    // Find user with matching email and OTP
     const usersRef = db.collection('users');
     const snapshot = await usersRef
       .where('email', '==', email)
@@ -267,7 +246,6 @@ router.post('/reset-password', async (req, res) => {
 
     const user = { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
     
-    // Check if OTP is expired
     if (user.resetPasswordExpires && user.resetPasswordExpires < Date.now()) {
       return res.status(400).json({
         status: 'fail',
@@ -275,10 +253,8 @@ router.post('/reset-password', async (req, res) => {
       });
     }
 
-    // Hash the new password
     const hashedPassword = await bcrypt.hash(newPassword, 12);
 
-    // Update user password and clear OTP fields
     const userRef = db.collection('users').doc(user.id);
     await userRef.update({
       password: hashedPassword,
@@ -296,41 +272,6 @@ router.post('/reset-password', async (req, res) => {
     res.status(500).json({
       status: 'error',
       message: 'Internal server error during password reset'
-    });
-  }
-});
-
-// Debug route to check user OTP status
-router.get('/debug-user/:email', async (req, res) => {
-  try {
-    const { email } = req.params;
-    const user = await findUserByEmail(email);
-    
-    if (!user) {
-      return res.status(404).json({
-        status: 'fail',
-        message: 'User not found'
-      });
-    }
-
-    res.status(200).json({
-      status: 'success',
-      data: {
-        user: {
-          email: user.email,
-          hasOTP: !!user.resetPasswordOTP,
-          otp: user.resetPasswordOTP,
-          expires: user.resetPasswordExpires,
-          isExpired: user.resetPasswordExpires ? user.resetPasswordExpires < Date.now() : true,
-          currentTime: new Date().toISOString()
-        }
-      }
-    });
-  } catch (err) {
-    console.error('Debug user error:', err);
-    res.status(500).json({
-      status: 'error',
-      message: 'Internal server error'
     });
   }
 });
@@ -396,10 +337,8 @@ router.post('/signup', async (req, res) => {
       });
     }
 
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 12);
 
-    // Create new user
     const newUser = await createUser({
       fullName,
       phoneNumber,
@@ -410,12 +349,9 @@ router.post('/signup', async (req, res) => {
       address,
       panVatNumber: panVatNumber || null,
       productKey,
-      role: 'admin',
-      createdAt: new Date(),
-      updatedAt: new Date()
+      role: 'admin'
     });
 
-    // Mark product key as used
     const productKeyRef = db.collection('productKeys').doc(validProductKey.id);
     await productKeyRef.update({
       isUsed: true,
@@ -423,10 +359,8 @@ router.post('/signup', async (req, res) => {
       usedBy: newUser.id
     });
 
-    // Generate token
     const token = signToken(newUser.id);
 
-    // Remove password from response
     const { password: _, ...userWithoutPassword } = newUser;
 
     res.status(201).json({
@@ -457,7 +391,6 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Find user by email
     const user = await findUserByEmail(email);
     
     if (!user) {
@@ -467,7 +400,6 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Compare password
     const isPasswordCorrect = await bcrypt.compare(password, user.password);
     
     if (!isPasswordCorrect) {
@@ -477,10 +409,8 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Generate token
     const token = signToken(user.id);
 
-    // Remove password from response
     const { password: _, ...userWithoutPassword } = user;
 
     res.status(200).json({
@@ -565,7 +495,6 @@ router.get('/me', async (req, res) => {
       });
     }
 
-    // Remove password from response
     const { password, ...userWithoutPassword } = user;
 
     res.status(200).json({
